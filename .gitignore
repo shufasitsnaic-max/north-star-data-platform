@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────
+# NYC TLC Data Platform — .gitignore
+# Rule of thumb: ignore anything GENERATED, SECRET, or LARGE.
+# Only source + config should ever be committed.
+# ─────────────────────────────────────────────────────────────
+
+# ── Secrets & environment ────────────────────────────────────
+# Never commit credentials (Kafka, Postgres, cloud keys, etc.)
+.env
+.env.*
+*.env
+# ...but DO keep a committed template so others know what's needed:
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Virtual environments ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Data lake & large data ───────────────────────────────────
+# The TLC dataset and generated parquet are huge — keep them out of git.
+/data/
+*.parquet
+*.arrow
+# Raw trip files (un-ignore a small sample below if you want one in-repo)
+*.csv.gz
+# !data/samples/tiny_sample.csv
+
+# ── Docker (local volume mounts) ─────────────────────────────
+# docker-compose.yml itself stays tracked; only the mounted state is ignored.
+/volumes/
+*.pid
+
+# ── Airflow (generated runtime state) ────────────────────────
+orchestration/logs/
+airflow.db
+airflow-webserver.pid
+standalone_admin_password.txt
+webserver_config.py
+
+# ── Spark ────────────────────────────────────────────────────
+spark-warehouse/
+metastore_db/
+derby.log
+
+# ── dbt ──────────────────────────────────────────────────────
+transformations/target/
+transformations/dbt_packages/
+transformations/logs/
+.user.yml
+
+# ── ML / model artifacts ─────────────────────────────────────
+*.pkl
+*.joblib
+mlruns/
+ml_ops/triton_config/model_repository/*/1/model.*
+
+# ── Notebooks ────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Test & lint caches ───────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── IDE & OS ─────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
