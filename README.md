@@ -58,11 +58,13 @@ Each phase must pass its verification routine before the next begins.
 
 ## Getting started
 
-_TODO: fill in once Phase 1 lands._
+Phase 1 (gateway) can be run standalone, before Kafka/Docker Compose exist:
 
 ```bash
-# docker compose up --build   # (coming soon)
+cd gateway && uv sync && uv run uvicorn main:app
 ```
+
+_TODO: docker compose up --build, once Kafka (Phase 2) lands._
 
 ## Status
 
