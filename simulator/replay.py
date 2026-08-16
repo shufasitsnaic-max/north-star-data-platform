@@ -19,6 +19,11 @@ Config comes from env (for the container) with CLI overrides (for local runs):
     --start-datetime             begin replay at this pickup time  (the ML cutoff)
     --max-rows                   cap number of records replayed
     --sleep                      seconds to wait between records    (default 0)
+
+Memory: records are streamed one monthly file at a time, never concatenated.
+With the full 2023-01..2026-05 scope on disk, loading every file to sort it
+globally would mean ~120M rows in memory before the first record is sent. See
+iter_records() for why a per-file sort still yields a globally ordered replay.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from pathlib import Path
 import httpx
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from pyarrow import Table, concat_tables
+from pyarrow import Table
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("simulator")
@@ -98,19 +103,17 @@ def month_bounds(files: list[Path]) -> tuple[datetime, datetime]:
     return start, end
 
 
-def build_dataset(files: list[Path], start_dt: datetime | None) -> Table:
-    """Load, unify, drop out-of-month records, sort by pickup time, trim to >= start_dt."""
-    # promote_options="permissive": tolerate months whose optional columns
-    # differ, null-filling the gaps rather than erroring.
-    table = concat_tables([load_normalized(f) for f in files], promote_options="permissive")
+def prepare_month(path: Path, start_dt: datetime | None) -> Table:
+    """Load one month, drop out-of-month records, sort ascending, trim to >= start_dt."""
+    table = load_normalized(path)
 
     # TLC files contain a handful of records whose pickup_datetime falls far
     # outside the month they ship in (2023-01 carries stray 2008 and 2022 rows).
     # They're ~0.002% of records, but sorting ascending piles every one of them
     # at the front of the replay — so the stream would open on 2008 timestamps
     # and the hot path's event-time windows would span years of empty ground.
-    # Trust the filename over the field: keep only rows inside the loaded span.
-    start, end = month_bounds(files)
+    # Trust the filename over the field: keep only rows inside this file's month.
+    start, end = month_bounds([path])
     before = table.num_rows
     # `&` (not pc.and_) — Acero's expression engine has no `and_` function.
     table = table.filter(
@@ -121,14 +124,49 @@ def build_dataset(files: list[Path], start_dt: datetime | None) -> Table:
     if dropped:
         # Never drop rows silently — say how many and over what span.
         logger.info(
-            "dropped %d record(s) with pickup outside [%s, %s)",
-            dropped, start.date().isoformat(), end.date().isoformat(),
+            "%s: dropped %d record(s) with pickup outside [%s, %s)",
+            path.name, dropped, start.date().isoformat(), end.date().isoformat(),
         )
 
     table = table.sort_by([(PICKUP, "ascending")])
     if start_dt is not None:
         table = table.filter(pc.greater_equal(pc.field(PICKUP), pc.scalar(start_dt)))
     return table
+
+
+def iter_records(files: list[Path], start_dt: datetime | None, limit: int | None):
+    """Yield cleaned records in ascending pickup order, one month at a time.
+
+    Deliberately streams rather than building one table for the whole range.
+    With the full 2023-01..2026-05 scope downloaded that would be ~120M rows
+    concatenated and globally sorted in memory before a single record was sent —
+    tens of gigabytes, on a 16GB machine, to replay the first five thousand.
+
+    A per-file sort is sufficient for a *global* ordering here, and that is the
+    non-obvious part: the out-of-month filter above guarantees every row in a
+    file falls inside that file's own month, and the files are visited in
+    chronological order. So months cannot interleave, and concatenating
+    per-month sorts yields the same sequence a global sort would — without ever
+    holding more than one month.
+
+    Batching keeps the Python-side materialization bounded too: to_pylist() on a
+    3M-row month builds 3M dicts at once.
+    """
+    emitted = 0
+    for path in files:  # filename order is chronological for yellow_tripdata_YYYY-MM
+        table = prepare_month(path, start_dt)
+        if table.num_rows == 0:
+            continue
+        if limit is not None:
+            table = table.slice(0, limit - emitted)
+
+        logger.info("%s: replaying %d record(s)", path.name, table.num_rows)
+        for batch in table.to_batches(max_chunksize=10_000):
+            for row in batch.to_pylist():
+                yield clean_row(row)
+                emitted += 1
+        if limit is not None and emitted >= limit:
+            return
 
 
 def clean_row(row: dict) -> dict:
@@ -204,32 +242,45 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     start_dt = datetime.fromisoformat(args.start_datetime) if args.start_datetime else None
 
+    # A replay that begins at a cutoff has no use for the months before it, and
+    # opening them costs a full read each. Derive the lower file bound from the
+    # cutoff when one wasn't given explicitly, so `--start-datetime 2026-01-01`
+    # doesn't quietly scan all of 2023-2025 to find nothing.
+    start_month = args.start_month
+    if start_month is None and start_dt is not None:
+        start_month = start_dt.strftime("%Y-%m")
+        logger.info("no --start-month given; derived %s from --start-datetime", start_month)
+
     try:
-        files = discover_files(data_dir, args.start_month, args.end_month)
+        files = discover_files(data_dir, start_month, args.end_month)
         logger.info("loading %d file(s): %s", len(files), ", ".join(f.name for f in files))
-        table = build_dataset(files, start_dt)
     except (FileNotFoundError, OSError) as exc:
-        logger.error("could not build dataset: %s", exc)
+        logger.error("could not discover files: %s", exc)
         return 2
 
-    total = table.num_rows
-    limit = min(total, args.max_rows) if args.max_rows else total
-    logger.info("replaying %d of %d record(s)%s", limit, total,
-                f" from {start_dt.isoformat()}" if start_dt else "")
+    limit = args.max_rows or None
+    logger.info(
+        "replaying %s record(s)%s",
+        limit if limit else "all",
+        f" from {start_dt.isoformat()}" if start_dt else "",
+    )
 
     endpoint = f"{args.gateway_url}/events/trips"
     counts = {"sent": 0, "rejected": 0, "error": 0}
-    with httpx.Client() as client:
-        wait_for_gateway(client, args.gateway_url)
-        # Iterate the sorted table row-major. to_pylist materializes rows; we
-        # slice to `limit` first so a huge dataset doesn't balloon memory.
-        for i, row in enumerate(table.slice(0, limit).to_pylist()):
-            outcome = post_row(client, endpoint, clean_row(row))
-            counts[outcome] += 1
-            if args.sleep:
-                time.sleep(args.sleep)
-            if (i + 1) % 1000 == 0:
-                logger.info("progress: %d/%d (%s)", i + 1, limit, counts)
+    try:
+        with httpx.Client() as client:
+            wait_for_gateway(client, args.gateway_url)
+            for i, row in enumerate(iter_records(files, start_dt, limit)):
+                outcome = post_row(client, endpoint, row)
+                counts[outcome] += 1
+                if args.sleep:
+                    time.sleep(args.sleep)
+                if (i + 1) % 1000 == 0:
+                    logger.info("progress: %d sent (%s)", i + 1, counts)
+    except (FileNotFoundError, OSError) as exc:
+        logger.exception("failed while reading the dataset")
+        logger.error("replay aborted after %s: %s", counts, exc)
+        return 2
 
     logger.info("replay complete: %s", counts)
     return 0 if counts["error"] == 0 else 1

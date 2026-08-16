@@ -357,6 +357,49 @@ were stopped/created chasing this before `ports` was tried.
   later — deferred rather than adopted, since it is a new feature dependency and the browser
   path unblocks P2 today.
 
+### Rebuilding the dev container destroys all Docker state  · 2026-08-16
+
+**Observed:** after a Full Rebuild for the JDK, `kafka-console-consumer.sh` returned
+`UNKNOWN_TOPIC_OR_PARTITION` — the topic, the Kafka log, the Postgres volume and every
+built image were gone.
+
+This follows directly from the `docker-in-docker` choice above, and it is worth stating
+because the two decisions are usually discussed apart: **the Docker daemon lives inside the
+dev container**, so its volumes live inside the dev container too. `/workspaces` is on the
+codespace's persistent volume and survives a rebuild; `/var/lib/docker` is not and does not.
+
+- **The rule to remember:** a dev container rebuild is equivalent to `docker compose down -v`
+  plus `docker image prune -a`. Budget for a re-`up`, a re-replay, and image rebuilds after
+  any rebuild. Nothing is corrupted and nothing needs diagnosing — this is the design working
+  as chosen.
+- **What is safe:** the downloaded dataset in `data/raw/`, because it is workspace state, not
+  Docker state. Committed code likewise.
+- **Not worth "fixing".** Binding the host socket would preserve volumes across rebuilds but
+  reintroduces exactly the bind-mount resolution bug that `docker-in-docker` was chosen to
+  avoid. Paying a re-replay occasionally is cheaper than replaying against an empty directory
+  and not noticing.
+
+### JDK: installed in the Dockerfile, not via the java feature  · 2026-08-16
+
+PySpark needs a JVM to start even a `local[*]` session, so `batch_jobs`' adapter and its
+conformance test cannot run in this container without one.
+
+`ghcr.io/devcontainers/features/java:1` was tried first and left `java: command not found`.
+**Why it failed was never established** — the diagnostic went unrun and the rebuild that
+replaced it destroyed the evidence. The leading suspect is PATH: that feature installs into
+SDKMAN and reaches PATH only through a *nested* `containerEnv` reference
+(`${SDKMAN_DIR}/candidates/java/current/bin:${PATH}`), while `devcontainer.json` separately
+overrides PATH in `remoteEnv` for uv. Plausible, unconfirmed, recorded as such rather than
+asserted — this file already carries one retraction for a confident wrong diagnosis.
+
+**Decision: `apt-get install openjdk-17-jdk-headless` in `.devcontainer/Dockerfile`,** with
+`JAVA_HOME` set explicitly and a `java -version` in the build so a broken install fails at
+image build rather than at the first `pytest`. apt's openjdk registers `/usr/bin/java`
+through alternatives, so it is on PATH by construction with no cross-layer variable
+resolution that can silently fail. Same reasoning that already put the Yarn fix in that
+file. 17 because Spark 3.5.x targets it; it moves when the pyspark pin moves.
+**Verified: JDK 17.0.20 resolves in the rebuilt container.**
+
 ### Open
 - The dev container is committed but **unexercised** — Phase 2 verification is the next
   action, run from the browser terminal in codespace `northstar-p2`.
