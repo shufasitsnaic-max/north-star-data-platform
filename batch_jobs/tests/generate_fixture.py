@@ -32,7 +32,7 @@ Usage (inside the codespace, with kafka + gateway + a replay already done):
   uv run python tests/generate_fixture.py \
       --raw ../data/raw/yellow_tripdata_2023-01.parquet \
       --canonical /tmp/canonical.jsonl \
-      --rows 500
+      --rows 2000 --max-accepted 200
 
 Note the replay that filled the topic must have started at the beginning of the
 same month, otherwise the sampled prefix and the captured events don't overlap
@@ -172,7 +172,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build the adapter conformance fixture.")
     parser.add_argument("--raw", required=True, help="one TLC monthly parquet file")
     parser.add_argument("--canonical", required=True, help="JSONL dump of the topic")
-    parser.add_argument("--rows", type=int, default=500, help="raw rows to sample")
+    parser.add_argument("--rows", type=int, default=2000, help="raw rows to sample")
+    # Accepted pairs carry both halves and dominate the file size, so they are
+    # capped; rejected rows carry only the raw half and are ~1% of the sample, so
+    # all of them are kept. Scanning wide and keeping narrow gives a meaningful
+    # accept/reject boundary test without committing a megabyte of fixture.
+    parser.add_argument("--max-accepted", type=int, default=200,
+                        help="cap on accepted pairs written (rejections are never capped)")
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     args = parser.parse_args()
 
@@ -220,6 +226,9 @@ def main() -> int:
         )
         return 2
 
+    sampled_accepted = len(accepted)
+    accepted = accepted[: args.max_accepted]
+
     fixture = {
         "_comment": (
             "Golden fixture for the batch adapter. 'accepted' pairs a raw TLC row with the "
@@ -234,12 +243,25 @@ def main() -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(fixture, indent=1), encoding="utf-8")
+    # Say what was dropped: a capped sample must never read as full coverage.
+    rejection_rate = 100.0 * len(rejected) / max(sampled_accepted + len(rejected), 1)
     logger.info(
-        "wrote %s — %d accepted pair(s), %d rejected row(s) (%.1f%% rejected), %.0f KB",
-        out_path, len(accepted), len(rejected),
-        100.0 * len(rejected) / max(len(accepted) + len(rejected), 1),
-        out_path.stat().st_size / 1024,
+        "scanned %d row(s): %d accepted, %d rejected (%.2f%%)",
+        sampled_accepted + len(rejected), sampled_accepted, len(rejected), rejection_rate,
     )
+    if sampled_accepted > len(accepted):
+        logger.info("capped accepted pairs at %d of %d", len(accepted), sampled_accepted)
+    logger.info("wrote %s (%.0f KB)", out_path, out_path.stat().st_size / 1024)
+
+    # P2 and P3 both measured ~0.9-1.04% on this data (negative-fare refunds and
+    # voided trips the canonical model rightly refuses). A number far off that
+    # means the capture and the raw sample are not describing the same replay.
+    if not 0.3 <= rejection_rate <= 3.0:
+        logger.warning(
+            "rejection rate %.2f%% is outside the ~1%% seen in P2/P3 — check that the "
+            "topic capture and this raw file describe the same replay",
+            rejection_rate,
+        )
     return 0
 
 
