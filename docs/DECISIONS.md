@@ -366,6 +366,113 @@ were stopped/created chasing this before `ports` was tried.
 
 ---
 
+## Phase 3 — Hot path: Kafka -> event-time windows -> PostgreSQL  · 2026-08-16
+
+**Status:** code complete, **verification pending** — the `psql` row scan against a live
+replay has not been run yet.
+
+New component `hot_path/` (`consumer.py`, `windows.py`, `db.py`, `schemas.py`,
+`schema.sql`) and one new service, `postgres`. Nothing here names a data source.
+
+### Approved additions
+- **`postgres:16-alpine`** with an explicit `postgres-data` named volume and a `pg_isready`
+  healthcheck. Alpine for image size; revisit if an extension ever needs the Debian base.
+- **`psycopg[binary]==3.2.3`** — current generation, and maps Python `Decimal` to
+  `numeric` without a float round trip.
+- **`confluent-kafka==2.6.1`** — pinned to the gateway's exact version so producer and
+  consumer share one librdkafka generation.
+
+### Window shape
+- **5-minute tumbling windows over `pickup_datetime`**, one row per `(window_start,
+  zone_id)` plus a `zone_id IS NULL` citywide rollup row.
+- **Event time, not wall clock.** A replayed month bucketed by wall clock collapses into a
+  single bucket. `canonical.py` already committed to this by making `pickup_datetime`
+  non-nullable and never defaulting it to "now".
+- **Why 5 minutes:** the P2 run's `ingested_at` deltas measure replay at **~420 events/sec**
+  at `SLEEP=0`, i.e. ~366x event-time compression, so 5-minute windows surface ~1.2 new
+  windows/sec — live-feeling but readable. 1-minute windows would emit ~6/sec, which is
+  noise. Rejected 1-min for that reason and 15-min as too coarse for short demand spikes.
+- **Window size is data resolution, not display refresh.** Demo pacing is the simulator's
+  `SLEEP`; changing it needs no schema change. Recorded because conflating the two is the
+  obvious mistake.
+- **Rejected sliding windows** — they multiply row count by the overlap factor to produce a
+  smoothing the dashboard can compute from tumbling rows itself.
+- **Citywide stored, not derived at query time.** Keeps the dashboard headline a single
+  indexed row read, and stays correct for events whose zone is null.
+
+### Contract sharing: tolerant reader
+`hot_path/schemas.py` declares **only the fields it aggregates** and ignores the rest, rather
+than importing or copying the gateway's `TripEvent`.
+- Consumers reading a subset is standard event-driven practice: the gateway can add canonical
+  fields without breaking the hot path, and no build-time coupling is introduced.
+- **Rejected a shared `contracts/` package** — one source of truth, but it adds a directory
+  outside the CLAUDE.md structure and couples every component at build time.
+- **Rejected copying `canonical.py` wholesale** — two full copies drift with nothing enforcing
+  sync, and the hot path would validate fields it never reads.
+- Accepted risk, stated plainly: the definitions *can* drift. Mitigation is that the fields
+  chosen are contract-critical, so a breaking change fails loudly here rather than reading nulls.
+
+### Offset safety (the non-obvious decision)
+Aggregates live in memory, so a restart loses partially-filled windows. Committing offsets as
+events are consumed would resume mid-window, recompute that window from only its *remaining*
+events, and overwrite a correct stored row with an undercount.
+
+**Decision: each window records the lowest Kafka offset that fed it, and the consumer commits
+only `min(offset)` across still-open windows.** A restart therefore resumes at the first event
+of the oldest unfinished window and rebuilds it in full.
+- This is what makes the **absolute** upsert (`SET`, not `+=`) correct: rewriting a fully
+  recomputed window is always right.
+- **Rejected an additive upsert** (`trip_count = trip_count + EXCLUDED.trip_count`): it removes
+  the need to rebuild, but double-counts on any at-least-once redelivery. Absolute writes plus
+  a withheld commit is the pairing that works; mixing the two halves would corrupt totals.
+- **Rejected exactly-once (transactional Kafka -> Postgres)** — real complexity for a guarantee
+  idempotent upserts already provide here.
+- Two write cadences, deliberately split: a **liveness flush** every 2s rewrites open windows as
+  `is_final=false` (no commit — still filling), while **finalization** on the watermark writes
+  `is_final=true` and only then advances offsets. Liveness is a display concern, durability is
+  an offset concern.
+
+### Schema notes
+- **Upsert key is a unique index on `(window_start, COALESCE(zone_id, -1))`, not a primary key.**
+  PostgreSQL treats NULLs as distinct in a unique constraint, so a plain PK would let the
+  citywide row insert repeatedly. `COALESCE` folds it for uniqueness only — the stored value
+  stays NULL, so queries read as `WHERE zone_id IS NULL` rather than against a magic number.
+- **Money as `numeric`, never float**, matching the canonical contract's `Decimal`.
+- **`avg_distance_km` is nullable and averaged over events that carry a distance**, since
+  `trip_distance_km` is optional — dividing by `trip_count` would silently treat missing as zero.
+- **`is_final` is exposed to the dashboard** so P6 can style the in-progress bucket differently.
+- Schema is applied idempotently on every consumer start; no migration tool at this scale.
+
+### Verified locally (no Kafka or Postgres required)
+Exercised `windows.py` directly over synthetic events built from the real P2 payload shape —
+22 checks, all passing: 5-minute grid flooring at boundaries, zone + citywide double count from
+one event, Decimal sums and averages, null distance excluded from the mean, watermark
+finalization only once `window_end + grace` is passed, offset floor held at the oldest open
+window then advancing on finalization, late events counted rather than dropped, and the commit
+point stepping past a poison message.
+
+### Implementation notes
+- Late events for an evicted window **cannot** be reopened (their aggregates are gone), so they
+  are logged and counted, never silently dropped — per the no-silent-caps rule. `GRACE_MINUTES`
+  is the knob if they ever become non-trivial.
+- Malformed messages are logged with a stack trace, counted, and stepped over, with their offset
+  noted so the commit point cannot stall behind a poison message forever.
+- `hot_path` sets `restart: unless-stopped` — a worker, not a server; a broker or database blip
+  shouldn't silently stop the hot path.
+- Devcontainer now forwards **5432**, per the "ports arrive with their phase" rule.
+- Postgres credentials default to `northstar` and are overridable from the environment; nothing
+  secret is committed.
+- `confluent-kafka==2.6.1` has no installable Windows wheel (`Invalid Wheel-Version`), so
+  `uv sync` on `hot_path/` fails on the Windows dev machine. Harmless — the component only ever
+  runs in a Linux container — but it means local work on this component is container-only.
+
+### Open
+- The `psql` verification run itself.
+- Windows are held in memory: a long replay with many open zones grows the working set. Bounded
+  in practice by the watermark evicting closed windows, but untested at full-month scale.
+
+---
+
 ## Open / deferred decisions (cross-phase)
 
 - **ML task.** Per-trip **tip prediction** is the core model: train on <=cutoff records,

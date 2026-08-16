@@ -1,0 +1,14 @@
+[project]
+name = "hot-path"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # Same client family and version as the gateway's producer, so producer and
+    # consumer share one librdkafka generation.
+    "confluent-kafka==2.6.1",
+    # psycopg 3 with the prebuilt binary wheel (no local libpq build needed).
+    # Maps Python Decimal <-> PostgreSQL numeric without going through float.
+    "psycopg[binary]==3.2.3",
+    # Pinned to the gateway's version: both sides parse the same canonical JSON.
+    "pydantic==2.10.4",
+]

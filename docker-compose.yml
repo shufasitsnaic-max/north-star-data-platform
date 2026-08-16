@@ -1,11 +1,13 @@
 # North Star data platform — Compose stack.
 #
-# Phase 2 services only (phase discipline: we don't scaffold later phases here).
+# Phase 2 + 3 services (phase discipline: we don't scaffold later phases here).
 #   kafka      — single-node broker in KRaft mode (no Zookeeper)
 #   gateway    — FastAPI validate -> adapt -> produce to tlc-raw-events
 #   simulator  — one-shot replay job, behind the "replay" profile
+#   postgres   — serving store for hot-path window metrics
+#   hot_path   — Kafka consumer -> event-time windows -> postgres
 #
-# Bring up the long-running core:      docker compose up -d kafka gateway
+# Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
 # Trigger a replay when you're ready:  docker compose run --rm simulator
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
@@ -91,5 +93,59 @@ services:
       gateway:
         condition: service_healthy
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    ports:
+      # Host-facing, so `psql` from the dev container can run the P3 row scans.
+      - "5432:5432"
+    environment:
+      # Local-development credentials only. Overridable from the environment so
+      # a real deployment never inherits these; nothing secret is committed.
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+    volumes:
+      # Explicit named volume — the serving store must survive `docker compose down`.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready reports "accepting connections", which is what dependents need.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-northstar} -d ${POSTGRES_DB:-northstar}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  hot_path:
+    build: ./hot_path
+    container_name: hot_path
+    environment:
+      # In-network broker address (NOT localhost:9092 — that's host-only).
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: tlc-raw-events
+      KAFKA_GROUP_ID: hot-path-windows
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+      # Event-time window size. Data resolution, not display refresh rate —
+      # demo pacing is the simulator's SLEEP, not this.
+      WINDOW_MINUTES: "5"
+      # How far past a window's end the watermark must advance before the window
+      # is finalized. Absorbs mild out-of-order arrival.
+      GRACE_MINUTES: "10"
+      # Wall-clock cadence for rewriting still-filling windows, so the P6
+      # dashboard sees the in-progress bucket. Does not commit offsets.
+      FLUSH_INTERVAL_SECONDS: "2"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # A worker, not a server: restart it if it dies so a transient broker or
+    # database blip doesn't silently stop the hot path.
+    restart: unless-stopped
+
 volumes:
   kafka-data:
+  postgres-data:
