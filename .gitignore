@@ -29,7 +29,16 @@ ENV/
 
 # ── Data lake & large data ───────────────────────────────────
 # The TLC dataset and generated parquet are huge — keep them out of git.
-/data/
+#
+# Ignore the *contents* of /data/ but keep the directory itself tracked, via a
+# .gitkeep. Compose bind-mounts ./data into the simulator, and Docker creates a
+# missing bind-mount source as *root* — which then blocks data_fetcher from
+# writing into it (Errno 13). Shipping an empty tracked directory means
+# `git clone` creates it as the developer, so Docker never has to.
+# Note: this must be `/data/*`, not `/data/` — a trailing slash excludes the
+# directory outright and no negation inside it can match.
+/data/*
+!/data/.gitkeep
 *.parquet
 *.arrow
 # Raw trip files (un-ignore a small sample below if you want one in-repo)
