@@ -1,0 +1,11 @@
+[project]
+name = "simulator"
+version = "0.1.0"
+# Replays historical TLC parquet records through the gateway in pickup_datetime
+# order, turning a static dataset into a "live" event stream. Knows nothing of
+# Kafka or the canonical schema — it only speaks the gateway's HTTP contract.
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow==18.1.0",
+    "httpx==0.28.1",
+]

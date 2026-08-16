@@ -1,0 +1,5 @@
+# Keep the image lean and avoid baking a host-built venv into the container.
+.venv/
+__pycache__/
+*.pyc
+*.pyo

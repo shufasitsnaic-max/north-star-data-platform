@@ -55,8 +55,9 @@ class TripEvent(BaseModel):
 
     # --- trip identity ---
     # pickup_datetime is the canonical event time for downstream windowing
-    # (Flink watermarks key off this, not ingested_at) — it must come from
-    # the source record and is never defaulted to "now".
+    # (the hot-path consumer keys its rolling windows off this, not
+    # ingested_at) — it must come from the source record and is never
+    # defaulted to "now".
     pickup_datetime: datetime
     dropoff_datetime: datetime
     pickup_location: TripLocation

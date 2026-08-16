@@ -1,0 +1,9 @@
+[project]
+name = "data-fetcher"
+version = "0.1.0"
+# On-demand utility: downloads TLC monthly parquet into gitignored data/raw/.
+# Not part of the always-on Compose stack — run it by hand before a simulation.
+requires-python = ">=3.11"
+dependencies = [
+    "httpx==0.28.1",
+]

@@ -1,0 +1,95 @@
+# North Star data platform — Compose stack.
+#
+# Phase 2 services only (phase discipline: we don't scaffold later phases here).
+#   kafka      — single-node broker in KRaft mode (no Zookeeper)
+#   gateway    — FastAPI validate -> adapt -> produce to tlc-raw-events
+#   simulator  — one-shot replay job, behind the "replay" profile
+#
+# Bring up the long-running core:      docker compose up -d kafka gateway
+# Trigger a replay when you're ready:  docker compose run --rm simulator
+#
+# Every stateful service gets an explicit named volume (no ephemeral data).
+
+services:
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: kafka
+    ports:
+      # Host-facing listener, for console tools run from the host.
+      - "9092:9092"
+    environment:
+      # --- KRaft: this one node is both broker and controller ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Two data listeners: PLAINTEXT for in-network clients (gateway), and
+      # PLAINTEXT_HOST advertised as localhost for tools run on the host.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # --- single-node replication factors (a 1-node cluster can't do more) ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # One partition by default so the simulator's global pickup_datetime order
+      # is preserved on the topic (Kafka only orders within a partition).
+      KAFKA_NUM_PARTITIONS: 1
+      # Let the gateway's first produce create tlc-raw-events (1 partition).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Persist the log to the named volume, not container-ephemeral storage.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Broker is "ready" once it answers a metadata/list request.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    ports:
+      - "8000:8000"
+    environment:
+      # In-network broker address (NOT localhost:9092 — that's host-only).
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: tlc-raw-events
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # slim image has no curl; use stdlib to hit /health.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  simulator:
+    build: ./simulator
+    container_name: simulator
+    # Profile => does NOT start on a bare `docker compose up`; run it on demand:
+    #   docker compose run --rm simulator
+    profiles: ["replay"]
+    environment:
+      GATEWAY_URL: http://gateway:8000
+      DATA_DIR: /data/raw
+      # Modest default replay for the P2 smoke test; override at runtime, e.g.
+      #   docker compose run --rm -e MAX_ROWS=0 -e START_DATETIME=2024-01-01T00:00:00 simulator
+      MAX_ROWS: "5000"
+      SLEEP: "0"
+    volumes:
+      # Read-only: the simulator only ever reads the downloaded dataset.
+      - ./data:/data:ro
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
