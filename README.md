@@ -59,8 +59,8 @@ Each phase must pass its verification routine before the next begins.
 - [x] **Phase 1** — Validation gateway (FastAPI + Pydantic, 422 on bad input)
 - [x] **Phase 2** — Kafka cluster + gateway producer + replay simulator (`tlc-raw-events`)
 - [x] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
-- [ ] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet *(planned; design
-      recorded in `docs/DECISIONS.md`)*
+- [ ] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet *(in progress — step 1
+      of 6 built; full design and a resume checklist are in `docs/DECISIONS.md`)*
 - [ ] **Phase 5** — ML: train / predict / daily evaluation (Airflow-scheduled)
 - [ ] **Phase 6** — Streamlit dashboard (hot + cold + preds + alerts)
 
@@ -140,6 +140,20 @@ cd gateway && uv sync && uv run uvicorn main:app
 ## Status
 
 Phases 1–3 complete and verified end-to-end (validation gateway, Kafka + producer +
-replay simulator, hot path -> PostgreSQL). Phase 4 (cold path: Airflow + Spark ->
-partitioned Parquet) is designed but not yet built — the full plan, including rejected
-alternatives, is in `docs/DECISIONS.md`.
+replay simulator, hot path -> PostgreSQL).
+
+**Phase 4 (cold path) is in progress.** Step 1 of 6 is built: `batch_jobs/` holds the
+canonical Spark schema, a vectorized TLC adapter, and a conformance test that pins that
+adapter to the gateway's own output. It needs no cluster, no Kafka and no database:
+
+```bash
+cd batch_jobs && uv run pytest -v
+```
+
+Still to come: the bulk loader and Spark cluster, the Kafka -> lake job, daily
+aggregates, and the Airflow DAGs. The full design — with rejected alternatives and a
+resume checklist — is in `docs/DECISIONS.md`.
+
+**Data scope:** 2023-01 .. 2026-05, with the train/replay cutoff at 2025-12-31. Everything
+at or before the cutoff is backfilled from the raw files; everything after it arrives over
+Kafka as the simulator replays it.

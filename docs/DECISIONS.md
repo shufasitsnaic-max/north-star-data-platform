@@ -571,10 +571,44 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
 
-**Status: PLANNED — nothing in this section is implemented yet.** Recorded before writing
-code so the design survives a lost chat session. Anything here may still change during
-implementation; the entry gets a `VERIFIED` status and a verification run appended when P4
-actually passes. Read it as intent, not as a description of the repo.
+**Status: IN PROGRESS — step 1 of 6 built, the rest is still design.** The plan below was
+recorded *before* writing any code so it would survive a lost session; steps 2-6 remain
+intent rather than a description of the repo. What exists today is recorded under "Step 1"
+near the end of this entry.
+
+| # | Step | State |
+|---|------|-------|
+| 1 | canonical Spark schema + batch adapter + conformance test | **built**, `fba0137` |
+| 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | not started |
+| 3 | `stream_to_lake.py` (Kafka -> lake) | not started |
+| 4 | `aggregate_daily.py` + staging/merge into Postgres | not started |
+| 5 | `orchestration/` image + both DAGs + Airflow services | not started |
+| 6 | full 36-month backfill + verification run | not started |
+
+### Resuming (read this first)
+
+The stack lives in codespace `north-star-data-platform` at
+`/workspaces/north-star-data-platform`; nothing runs on the Windows dev machine. A dev
+container rebuild wipes all Docker state (see the dev-environment entry), so after any
+rebuild expect to re-`up` and re-replay before anything works.
+
+```bash
+# 1. confirm the tree is clean and in sync in BOTH places before touching anything
+git -C /workspaces/north-star-data-platform status -sb
+
+# 2. bring the stack up (rebuilds images if they were wiped)
+cd /workspaces/north-star-data-platform ; docker compose up -d kafka gateway postgres hot_path
+
+# 3. the topic is only populated by an explicit replay
+cd /workspaces/north-star-data-platform ; docker compose run --rm simulator
+
+# 4. step 1's drift guard — needs no cluster, no Kafka, no database
+cd /workspaces/north-star-data-platform/batch_jobs ; uv run pytest -v
+```
+
+**First action next session:** confirm step 1's test suite is fully green (7 tests). The
+final post-fix run was never pasted back — 5 of 6 passed before the fix, and the fix is
+believed complete but unconfirmed. Do not start step 2 on an unverified step 1.
 
 ### The conceptual correction worth keeping (cold path != old data)
 
@@ -798,18 +832,77 @@ Front-loads the component most likely to be wrong (the adapter), defers the heav
 5. `orchestration/` image + both DAGs + Airflow services
 6. Full 36-month backfill, verification run, this entry updated to `VERIFIED`
 
+### Step 1 — canonical schema, batch adapter, drift guard  · built 2026-08-16
+
+`batch_jobs/` now contains `schemas/canonical_spark.py`, `adapters/tlc_batch_adapter.py`,
+`common/{config,spark}.py`, and `tests/` with the generator, the conformance test and the
+committed fixture. Runs in local Spark — no cluster, no Kafka, no database.
+
+Decisions made *during* implementation that the plan above did not anticipate:
+
+- **Two schemas, wire and lake.** Pydantic's `model_dump_json()` emits `Decimal` and
+  `datetime` as JSON **strings**, so `WIRE_SCHEMA` reads them as `StringType` and casts
+  afterwards. Rejected letting Spark's JSON reader coerce them directly: on any format it
+  dislikes it yields NULL rather than an error, so a serialization change would silently
+  empty the money columns instead of failing.
+- **`WIRE_SCHEMA` omits `source_extras` entirely.** A source-agnostic wire schema cannot know
+  that object's shape. `stream_to_lake` will extract it with
+  `get_json_object(value, '$.source_extras')` and parse it with the injected schema.
+- **`source_extras`' shape is injected, not declared.** `lake_schema()` takes the `StructType`
+  as a parameter; the TLC adapter supplies it. Rejected a JSON-string column — source-agnostic
+  but ~30x the bytes and a parse on every read — and rejected hardcoding TLC's field names in
+  the schema module, which is the one file forbidden from naming a source. The precedent that
+  makes this legitimate: `KAFKA_TOPIC: tlc-raw-events` is already source-specific
+  *configuration* handed to the source-agnostic hot path. Configuration may know the source;
+  code may not.
+- **Exact-Decimal arithmetic, not doubles.** Money and distance cast to `Decimal(20,8)` first,
+  compute, and narrow only at the end, mirroring the gateway's `Decimal(str(x))`. This is what
+  let the conformance test compare **values** rather than tolerances — and it held: 200 real
+  records matched field for field, including the `Decimal x 1.609344 -> double` conversion.
+- **`event_id` is sha256 of the natural key, not `uuid4`.** The gateway can afford randomness
+  because it sees each record once; a batch job that re-runs a month must produce identical
+  rows, or the idempotency check in step 6 compares fresh UUIDs forever. Excluded from the
+  conformance comparison alongside `ingested_at` — both are envelope metadata the contract
+  defines as producer-assigned, which is exactly why `adapt_tlc()` takes them as parameters.
+- **`ingested_at` on backfilled rows is when the backfill ran.** The gateway never saw them;
+  claiming otherwise would be a lie in the audit trail.
+- **Nullability is deliberately excluded from the schema comparison.** Spark reads Parquet
+  back with every field nullable regardless of what was written, so two writers differing only
+  on that axis cannot corrupt each other — while differing names, order or types can. Worth
+  recording because the naive version was also *inconsistent*: a top-level field's nullability
+  lives outside its `dataType` but a struct field's lives inside its parent's, so it policed
+  nested fields and ignored the rest.
+
+**The bug the test caught, and why it mattered.** The adapter coalesced the surcharge fields
+to zero. But `TLCTripInput` declares them `float = 0`, **not** `Optional[float]` — so the zero
+defaults an *absent key*, while an explicit null is a type error the gateway answers with a
+422. The simulator converts NaN to `None`, so a NaN surcharge genuinely arrives as JSON null
+and is genuinely refused. The batch adapter would therefore have written rows into the lake
+that never reached the bus — a silent divergence between the two paths, in the one component
+whose entire job is to not diverge. Absent and null are now distinguished, with a direct test.
+Note the fixture's 22 rejections were all negative-fare, so the boundary test passed *despite*
+the bug; it surfaced only through the schema assertion.
+
+**Fixture:** 2,000 rows scanned from 2023-01, 200 accepted pairs kept, all 22 rejections kept,
+302 KB. Rejection rate **1.10%**, against P2's 0.9% and P3's 1.04% on the same data — three
+independent measurements converging on the same refund/void rate.
+
 ### Open
 
-- **Simulator footgun:** setting `START_DATETIME` without `START_MONTH` makes `build_dataset`
-  load and globally sort all 41 months (~120M rows) and OOM. `discover_files()` already
-  supports the range flags, so the fix is a ~3-line default deriving `start_month` from
-  `start_datetime`. In scope for P4 since P4 is what makes 41 months present.
-- Whether TLC has actually published through 2026-05 at fetch time. If the last month or two
-  are missing, the cutoff still holds; the replay just has less runway.
+- **Confirm step 1 is fully green.** 5 of 6 tests passed before the null-vs-absent fix; the
+  post-fix run (7 tests) was never pasted back. Believed complete, unverified.
+- **Fixed since this entry was written:** the simulator footgun. `iter_records()` now streams
+  one month at a time instead of concatenating all 41 (`ce43357`) — a per-file sort still
+  yields a globally ordered replay because the out-of-month filter keeps every row inside its
+  own file's month. Also derives `--start-month` from `--start-datetime`.
+- **Resolved:** TLC has published through **2026-05**; the full range is downloaded.
 - 36 months is ~110M rows — more than scikit-learn will want to train on directly. Sampling
   strategy is a P5 problem, flagged here because it's a consequence of this scope choice.
 - Disk: ~2GB of parquet plus ~3.5GB of Spark/Airflow images against the codespace's 32GB.
   Should fit; unmeasured.
+- The 302 KB fixture is committed as a knowing exception to the no-data rule. If it becomes a
+  nuisance, the cheaper route is fewer accepted pairs, not regenerating it on demand — a
+  skippable drift guard guards nothing.
 
 ---
 

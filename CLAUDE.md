@@ -71,11 +71,12 @@ Each phase has a verification routine that **must pass before advancing**. Do no
 scaffold future phases early.
 
 - **P1 — Gateway** (done): `curl` a payload with corrupt types -> HTTP **422**, no crash.
-- **P2 — Kafka + producer + simulator:** run the simulator; confirm events land on the
+- **P2 — Kafka + producer + simulator** (done): run the simulator; confirm events land on the
   topic via `kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic tlc-raw-events --from-beginning`.
-- **P3 — Hot path:** `psql` row scans confirm rolling-window metrics update as the
+- **P3 — Hot path** (done): `psql` row scans confirm rolling-window metrics update as the
   consumer processes replayed events.
-- **P4 — Cold path:** `pyarrow.parquet.ParquetFile('/data/lake/...').metadata` asserts
+- **P4 — Cold path** (in progress, step 1 of 6 — see `docs/DECISIONS.md` for the step table
+  and a resume checklist): `pyarrow.parquet.ParquetFile('/data/lake/...').metadata` asserts
   schema + `year=/month=/day=` partitions.
 - **P5 — ML:** train on <=cutoff; predictions written to Postgres; Airflow daily-eval DAG
   compares predicted vs actual and records error metrics.
