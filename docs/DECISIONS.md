@@ -368,8 +368,8 @@ were stopped/created chasing this before `ports` was tried.
 
 ## Phase 3 — Hot path: Kafka -> event-time windows -> PostgreSQL  · 2026-08-16
 
-**Status:** code complete, **verification pending** — the `psql` row scan against a live
-replay has not been run yet.
+**Status: VERIFIED end-to-end 2026-08-16** in codespace `northstar` — see "Verification run"
+below.
 
 New component `hot_path/` (`consumer.py`, `windows.py`, `db.py`, `schemas.py`,
 `schema.sql`) and one new service, `postgres`. Nothing here names a data source.
@@ -466,10 +466,63 @@ point stepping past a poison message.
   `uv sync` on `hot_path/` fails on the Windows dev machine. Harmless — the component only ever
   runs in a Linux container — but it means local work on this component is container-only.
 
+### Verification run · 2026-08-16
+Replayed 50,000 rows (`49,482` accepted, `518` rejected = **1.04%**, matching the ~0.9%
+negative-fare refund rate P2 measured on the same data). Covered event time
+`2023-01-01 00:00` -> `15:45`. **P3 verification passes.**
+
+Four independent cross-checks, not just "rows exist":
+- **`open windows = 3`, stable for the whole replay.** Exactly what a 5-minute window plus a
+  10-minute grace predicts — the filling window plus two awaiting grace. A wrong watermark
+  would make this drift or grow without bound.
+- **Throughput agrees with an independent estimate.** ~330 trips per 5-minute citywide window
+  = ~66/min, against 3,066,766 rows / 44,640 minutes = **68.7/min** derived separately from
+  the dataset. Two unrelated routes to the same number.
+- **Rollup invariant holds.** For window `15:30`, citywide `trip_count` = 331 = the sum of
+  that window's per-zone counts. The two are produced by different code paths over the same
+  events, so agreement rules out both double-counting and rollup drift.
+- **`is_final` tracks the watermark.** Newest window `f`, all older windows `t`.
+
+Totals: 190 citywide windows (190 x 5 min = 950 min = the 15.8h of event time covered),
+10,443 zone rows across **211 distinct zones** of TLC's 265 — plausible for half a day of
+yellow-cab activity. Internal arithmetic also holds: `total_revenue/trip_count` ~30.60 against
+`avg_fare` 22.36 leaves ~5.00 of surcharges beyond the 3.25 tip, matching congestion 2.50 +
+extra 1.00 + mta 0.50 + improvement 1.00.
+
+**The cash-tip artifact is now visible in aggregate:** `avg_tip / avg_fare` ~14.5% citywide,
+where NYC card tipping runs 22-24%. That gap is the P5 hazard recorded under Phase 2 showing
+up as a real number rather than a theoretical concern.
+
+### Runtime defects found and fixed during verification
+- **`831b558` — hot path started before the topic existed.** The topic is created by the
+  gateway's first produce, so on a fresh Kafka volume the consumer logged
+  `UNKNOWN_TOPIC_OR_PART` on every poll. Worse, librdkafka's default 5-minute metadata refresh
+  would have left it idle for minutes after a replay finally created the topic. Dropped
+  `topic.metadata.refresh.interval.ms` to 10s and demoted the message to a once-only
+  informational waiting state. Rejected having the consumer create the topic itself: production
+  is the gateway's concern, and a consumer that creates topics hides ordering bugs.
+- **`3ff8dc1` — Docker created `./data` as root.** Compose bind-mounts `./data` into the
+  simulator; when the directory is absent Docker creates the bind-mount source as root, after
+  which `data_fetcher` cannot `mkdir data/raw` (Errno 13) and `git pull` cannot write into it
+  either. Fixed by tracking an empty `data/.gitkeep` so `git clone` creates the directory as
+  the developer. Ignore rule had to become `/data/*` rather than `/data/` — a trailing slash
+  excludes the directory outright and no negation inside it can match.
+
 ### Open
-- The `psql` verification run itself.
 - Windows are held in memory: a long replay with many open zones grows the working set. Bounded
-  in practice by the watermark evicting closed windows, but untested at full-month scale.
+  in practice by the watermark evicting closed windows (observed steady at 3 open windows over
+  50k events), but untested at full-month scale.
+- Verified against a 50k-row slice, not the full month. Sustained-throughput behaviour and the
+  eventual table size at 2023-2025 scale are unmeasured.
+
+### Operational lesson — one environment, not two
+Verification cost far more rounds than the code warranted, because a second codespace was
+created on a mistaken diagnosis and the two then diverged: one held the fetched data and Kafka
+volume, the other held uncommitted devcontainer edits from an earlier session. Symptoms that
+looked like Phase 3 bugs (missing topic, missing dataset, a blocked `git pull`) were all
+environment drift. **Keep exactly one codespace, and commit from it rather than leaving work
+uncommitted there** — an uncommitted change inside a remote environment is invisible from the
+local clone, and `has_uncommitted_changes` in the API is a real signal worth heeding.
 
 ---
 
