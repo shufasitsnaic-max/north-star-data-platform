@@ -33,6 +33,21 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": {
       "moby": true,
       "dockerDashComposeVersion": "v2"
+    },
+
+    // A JDK, solely so PySpark can start a local SparkSession in this container.
+    //
+    // The Spark *cluster* has its own Java inside the spark-master/spark-worker
+    // images — this is for the fast edit-test loop: batch_jobs' adapter and its
+    // conformance test run in local[*] mode with no cluster, no Kafka and no
+    // database, and without a JDK here they cannot run at all.
+    //
+    // 17 because that is what Spark 3.5.x targets; it moves when the pyspark pin
+    // in batch_jobs/pyproject.toml and the image tags move.
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "17",
+      "installMaven": false,
+      "installGradle": false
     }
   },
 
@@ -65,10 +80,12 @@
     }
   },
 
-  // Default Codespaces machine is 2-core / 8 GB, which is enough for the
-  // current stack (Kafka + gateway). Phase 4 adds Spark and Airflow — if the
-  // stack starts getting OOM-killed then, rebuild on a 4-core machine via the
-  // Codespaces "Change machine type" menu. Note a 4-core machine burns
-  // included core-hours at twice the rate.
+  // Machine size: this project now needs 4-core / 16 GB (standardLinux32gb),
+  // set via the Codespaces "Change machine type" menu — it is a per-codespace
+  // setting, not something this file can pin. The default 2-core / 8 GB carried
+  // Phases 1-3 but not Phase 4: Kafka, Postgres, the gateway, the hot path, a
+  // Spark master and worker, and three Airflow containers come to roughly
+  // 10.5 GB resident. Note a 4-core machine burns included core-hours at twice
+  // the rate, so stop the codespace when you are done for the day.
   "remoteUser": "vscode"
 }

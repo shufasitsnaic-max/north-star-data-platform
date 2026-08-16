@@ -1,0 +1,30 @@
+# Cold-path Spark jobs. Its own uv project, like every other component —
+# no shared environment, no requirements.txt (see CLAUDE.md).
+#
+# Run from inside batch_jobs/ so imports resolve without a package prefix,
+# matching the convention gateway/ and hot_path/ already use.
+
+[project]
+name = "batch-jobs"
+version = "0.1.0"
+description = "Spark cold-path transforms: raw + bus -> partitioned Parquet"
+requires-python = ">=3.11"
+dependencies = [
+    # Pinned to the exact version the spark-master/spark-worker images run.
+    # A PySpark client newer than the cluster fails at task deserialization,
+    # so this pin and the image tag must move together.
+    "pyspark==3.5.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    # Fixture generation only: reads a slice of raw parquet without needing a
+    # Spark session. Deliberately not a runtime dependency.
+    "pyarrow>=17.0",
+]
+
+[tool.pytest.ini_options]
+# Tests import schemas/ and adapters/ as top-level modules, same as the jobs do.
+pythonpath = ["."]
+testpaths = ["tests"]
