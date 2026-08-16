@@ -131,9 +131,9 @@ job or a Postgres constraint, not a new tool.
 
 ## Phase 2 — Kafka + producer + replay simulator  · 2026-08-16
 
-**Status:** code complete, **verification pending** — the end-to-end run (Compose up ->
-simulator -> console-consumer) has not been executed yet because Docker was not installed
-on the dev machine. Everything below the Docker line *has* been verified locally.
+**Status: VERIFIED end-to-end 2026-08-16** in codespace `northstar-p2` — see
+"Verification run" below. (Superseded status: was "code complete, verification pending"
+while the dev machine had no working Docker daemon.)
 
 ### Kafka topology
 - **Single-node Kafka in KRaft mode, no Zookeeper.** One container instead of two, and
@@ -222,10 +222,34 @@ through `TLCTripInput` -> `adapt_tlc`:
   is an event you trigger, not a daemon.
 - **`./data` is mounted read-only** into the simulator. It only ever reads.
 
+### Verification run · 2026-08-16
+Full path exercised in codespace `northstar-p2`: `data_fetcher` -> Compose (`kafka` +
+`gateway`) -> `docker compose run --rm simulator` -> `kafka-console-consumer.sh
+--from-beginning --max-messages 5`. Five canonical events printed, then
+`Processed a total of 5 messages`. **P2 verification passes.**
+
+What the payload confirms beyond "messages exist":
+- **Replay order is preserved.** `pickup_datetime` strictly ascending across the five
+  (`00:00:00, :05, :06, :08, :09`) — the single-partition topic is holding global order
+  as intended, which P3's event-time windowing depends on.
+- **Arithmetic is internally consistent.** For all five, `fare + surcharges + tip + tolls
+  == total`, and `surcharges_amount` equals the sum of the `source_extras` components
+  (extra + mta_tax + improvement_surcharge + congestion + airport). The rollup is correct.
+- **Canonical contract holds.** Money as strings (Decimal, no float drift), distance in km,
+  `payment_type` mapped to the enum (`CASH`/`CARD`/`OTHER`), source-specific leftovers
+  quarantined in `source_extras`, nulls where TLC genuinely has none.
+
 ### Open
-- Verification run itself, once a working Docker daemon exists — see the
-  dev-environment entry below, which is what unblocks it.
 - Only 2023-01 is downloaded so far; the full 2023–2025 scope is a longer fetch.
+- **Cash trips report `tip_amount: 0.0` — a data artifact, not a fact.** Two of the five
+  sampled events are `payment_type: CASH` with a zero tip. TLC only captures tips paid
+  through the meter, so cash tips are systematically recorded as zero rather than as
+  unknown. This is a **P5 modelling hazard**: training tip prediction on unfiltered data
+  teaches the model "cash implies no tip," which is an artifact of collection, not
+  behaviour. Decide in P5 whether to train on card trips only (cleanest), or to model tip
+  *rate* conditional on payment type. Flagged now because it is invisible once the data is
+  aggregated. Nothing to change in P2 — the adapter is correctly passing through what the
+  source says.
 
 ---
 
