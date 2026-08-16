@@ -33,22 +33,12 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": {
       "moby": true,
       "dockerDashComposeVersion": "v2"
-    },
-
-    // A JDK, solely so PySpark can start a local SparkSession in this container.
-    //
-    // The Spark *cluster* has its own Java inside the spark-master/spark-worker
-    // images — this is for the fast edit-test loop: batch_jobs' adapter and its
-    // conformance test run in local[*] mode with no cluster, no Kafka and no
-    // database, and without a JDK here they cannot run at all.
-    //
-    // 17 because that is what Spark 3.5.x targets; it moves when the pyspark pin
-    // in batch_jobs/pyproject.toml and the image tags move.
-    "ghcr.io/devcontainers/features/java:1": {
-      "version": "17",
-      "installMaven": false,
-      "installGradle": false
     }
+
+    // No java feature here on purpose — the JDK is installed in ./Dockerfile
+    // instead. ghcr.io/devcontainers/features/java was tried and left
+    // `java: command not found`; see the comment in that file for why, and why
+    // apt's openjdk is the more reliable route in this container.
   },
 
   // Ports for the phases that exist today. Later phases add their own

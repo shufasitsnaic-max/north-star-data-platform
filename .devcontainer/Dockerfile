@@ -33,3 +33,37 @@ RUN set -eux; \
     # opaque feature-install step.
     apt-get update; \
     rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# JDK 17, for PySpark.
+#
+# batch_jobs' adapter and its conformance test run a local SparkSession with no
+# cluster, no Kafka and no database — which still needs a JVM on this machine.
+# 17 is what Spark 3.5.x targets; it moves when the pyspark pin in
+# batch_jobs/pyproject.toml and the spark image tags move.
+#
+# Installed here rather than with ghcr.io/devcontainers/features/java, which was
+# tried first and left `java: command not found`. That feature installs into
+# SDKMAN and reaches PATH only via a *nested* containerEnv reference
+# (${SDKMAN_DIR}/candidates/java/current/bin:${PATH}); this devcontainer.json
+# also overrides PATH in remoteEnv for uv, and the two layers don't compose
+# reliably. apt's openjdk registers /usr/bin/java through alternatives, so it is
+# on PATH by construction and needs no plumbing at all.
+#
+# Same reasoning that put the Yarn fix in this file: a step we control beats a
+# feature we have to debug from inside a container we can't ssh into.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends openjdk-17-jdk-headless; \
+    rm -rf /var/lib/apt/lists/*; \
+    # Resolve the real install directory (arch-dependent: .../java-17-openjdk-amd64
+    # vs -arm64) by walking back from the alternatives symlink, then pin a stable
+    # name so JAVA_HOME below doesn't have to know the architecture.
+    ln -sfn "$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")" /usr/lib/jvm/current; \
+    # Fail the build loudly here rather than at the first pytest run.
+    java -version
+
+# PySpark checks JAVA_HOME before falling back to PATH; set it explicitly so
+# neither path depends on shell profile files being sourced.
+ENV JAVA_HOME=/usr/lib/jvm/current
