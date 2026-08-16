@@ -114,8 +114,11 @@ _STRING_COLUMNS = ["store_and_fwd_flag"]
 
 _ALL_RAW_COLUMNS = _INT_COLUMNS + _DOUBLE_COLUMNS + _TIMESTAMP_COLUMNS + _STRING_COLUMNS
 
-# Fields the gateway defaults to 0 when absent, per TLCTripInput. Anything not
-# listed here stays null when missing.
+# Declared on TLCTripInput as `float = 0` — note NOT Optional[float]. That makes
+# the 0 a default for an *absent key*, while an explicit null is a type error the
+# gateway answers with a 422. The distinction matters here because the simulator
+# converts NaN to None, so a NaN surcharge arrives as JSON null and is refused.
+# Absent column -> 0; present-but-null value -> rejected. See _reject_reason.
 _DEFAULT_ZERO = ["extra", "mta_tax", "tip_amount", "tolls_amount", "improvement_surcharge"]
 
 
@@ -135,14 +138,14 @@ def _resolve_raw_columns(raw: DataFrame) -> DataFrame:
     for name in _ALL_RAW_COLUMNS:
         actual = lower_to_actual.get(name.lower())
         if actual is None:
-            selected.append(F.lit(None).cast(_raw_type(name)).alias(name))
+            # Absent column: the gateway would never see the key at all, so
+            # TLCTripInput's default applies. For everything else, a typed null.
+            default = F.lit(0.0) if name in _DEFAULT_ZERO else F.lit(None)
+            selected.append(default.cast(_raw_type(name)).alias(name))
             continue
-        column = F.col(f"`{actual}`").cast(_raw_type(name))
-        if name in _DEFAULT_ZERO:
-            # TLCTripInput gives these a default of 0, so a null here would be
-            # rejected by the gateway's model but accepted as 0 — match it.
-            column = F.coalesce(column, F.lit(0.0))
-        selected.append(column.alias(name))
+        # Present column: pass the value through untouched, nulls included, so
+        # _reject_reason can refuse them exactly as the gateway's model does.
+        selected.append(F.col(f"`{actual}`").cast(_raw_type(name)).alias(name))
 
     return raw.select(*selected)
 
@@ -194,16 +197,20 @@ def _reject_reason(month: str | None) -> Column:
     silently. Branch order determines only which reason is *reported* for a row
     that violates several rules; the accept/reject verdict is unaffected.
     """
-    required_missing = (
-        F.col("VendorID").isNull()
-        | F.col("PULocationID").isNull()
-        | F.col("DOLocationID").isNull()
-        | F.col("tpep_pickup_datetime").isNull()
-        | F.col("tpep_dropoff_datetime").isNull()
-        | F.col("fare_amount").isNull()
-        | F.col("total_amount").isNull()
-        | F.col("trip_distance").isNull()
-    )
+    # Non-Optional fields on TLCTripInput. A null in any of them is a type error
+    # the gateway answers with a 422 before the adapter ever runs.
+    required = [
+        "VendorID", "PULocationID", "DOLocationID",
+        "tpep_pickup_datetime", "tpep_dropoff_datetime",
+        "fare_amount", "total_amount", "trip_distance",
+        # `float = 0` is a default for an absent key, not a nullable type — an
+        # explicit null fails validation. Columns genuinely missing from a month
+        # were already materialized as 0 above, so they can never trip this.
+        *_DEFAULT_ZERO,
+    ]
+    required_missing = F.lit(False)
+    for name in required:
+        required_missing = required_missing | F.col(name).isNull()
 
     # The canonical model constrains each of these with ge=0. Note surcharges is
     # checked as the *sum*: the gateway sums first and validates the total, so a

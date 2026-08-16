@@ -184,6 +184,26 @@ def test_gateway_accepted_rows_are_all_accepted(spark, fixture_data):
     )
 
 
+def test_null_and_absent_differ_for_a_defaulted_field(spark, fixture_data):
+    """`extra: float = 0` defaults an ABSENT key; an explicit null is a 422.
+
+    Not Optional[float] — so the two cases are genuinely different on the
+    gateway, and an adapter that coalesced both to 0 would admit rows the
+    gateway refuses. The simulator converts NaN to None, so this is the actual
+    path a NaN surcharge takes, not a hypothetical.
+    """
+    good = fixture_data["accepted"][0]["raw"]
+
+    _, stats = _adapt(spark, [dict(good, extra=None)])
+    assert stats["accepted"] == 0, "a null in a non-Optional field must be rejected"
+    assert stats.get("missing_required") == 1
+
+    absent = spark.createDataFrame(_to_rows([good]), schema=RAW_SCHEMA).drop("extra")
+    canonical, stats = adapt_tlc_batch(absent, ingested_at=INGESTED_AT, month=None)
+    assert stats["accepted"] == 1, "an absent column must fall back to the default"
+    assert canonical.collect()[0]["source_extras"]["extra"] == 0.0
+
+
 def test_gateway_rejected_rows_are_all_rejected(spark, fixture_data):
     """And every row it refused must be refused here too.
 
@@ -295,6 +315,28 @@ def test_partition_columns_follow_event_time(spark, fixture_data):
     assert mismatched == 0
 
 
+def _ignoring_nullability(data_type):
+    """A copy of a type with every field marked nullable, nested types included.
+
+    Nullability is deliberately excluded from the schema comparison. Spark reads
+    Parquet back with all fields nullable no matter what was written, so two
+    writers differing only on that axis cannot corrupt each other's partitions —
+    whereas differing names, order or types absolutely can. Comparing it would
+    also be inconsistent rather than strict: a top-level field's nullability
+    lives outside its dataType, but a struct field's nullability lives *inside*
+    its parent's, so a naive comparison policed nested fields and ignored the
+    rest.
+    """
+    if isinstance(data_type, StructType):
+        return StructType(
+            [
+                StructField(field.name, _ignoring_nullability(field.dataType), nullable=True)
+                for field in data_type.fields
+            ]
+        )
+    return data_type
+
+
 def test_output_matches_the_declared_lake_schema(spark, fixture_data):
     """The adapter's frame must be exactly what lake_schema() promises.
 
@@ -305,8 +347,10 @@ def test_output_matches_the_declared_lake_schema(spark, fixture_data):
     canonical, _ = _adapt(spark, raw)
     expected = lake_schema(TLC_SOURCE_EXTRAS)
 
-    assert canonical.schema.fieldNames() == expected.fieldNames()
+    assert canonical.schema.fieldNames() == expected.fieldNames(), (
+        "lake column names or order differ from the declared schema"
+    )
     for produced_field, expected_field in zip(canonical.schema.fields, expected.fields):
-        assert produced_field.dataType == expected_field.dataType, (
-            f"{produced_field.name}: {produced_field.dataType} != {expected_field.dataType}"
-        )
+        produced = _ignoring_nullability(produced_field.dataType)
+        wanted = _ignoring_nullability(expected_field.dataType)
+        assert produced == wanted, f"{produced_field.name}: {produced} != {wanted}"
