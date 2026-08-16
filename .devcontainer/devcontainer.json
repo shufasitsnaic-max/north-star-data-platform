@@ -14,7 +14,13 @@
   // Python 3.11 to match the gateway/simulator images (python:3.11-slim), so
   // anything run directly in the container (e.g. data_fetcher) behaves the same
   // as it does inside a service image.
-  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+  //
+  // Built from a local Dockerfile rather than referenced with "image" only
+  // because the upstream image has a broken Yarn apt source that breaks feature
+  // installs — see the comments in ./Dockerfile.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
 
   "features": {
     // A Docker daemon INSIDE this container, not the host's socket.

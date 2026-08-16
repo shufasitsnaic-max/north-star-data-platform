@@ -290,9 +290,31 @@ Airflow all run under Compose exactly as designed.
 - **Default 2-core / 8 GB machine.** Enough for Kafka + gateway. Revisit at P4 when Spark
   and Airflow land — a 4-core machine burns included core-hours twice as fast.
 
+### Build fix — the base image needed wrapping in a Dockerfile
+First codespace create **failed**, landing in the Alpine recovery container with no Docker
+daemon. Cause: `mcr.microsoft.com/devcontainers/python:1-3.11-bookworm` ships a
+preconfigured Yarn apt source (`dl.yarnpkg.com`) whose signing key has since rotated, so
+every `apt-get update` in the image fails with `NO_PUBKEY 62D54FD4003F6525`. Dev container
+*features* run `apt-get update` during their install, so `docker-in-docker` aborted with
+exit 100 and took container creation down with it.
+
+**Decision: wrap the base image in `.devcontainer/Dockerfile`** that deletes the Yarn apt
+source, then runs `apt-get update` under `set -e` to prove apt is healthy. `devcontainer.json`
+switches from `"image"` to `"build".dockerfile`. Matching on the URL rather than a filename
+keeps it correct whether the image uses legacy `.list` or deb822 `.sources` format, and the
+verification step means a still-broken repo fails loudly at image build instead of inside an
+opaque feature-install step.
+
+- **Rejected: import the rotated Yarn key.** Chases an upstream key this project has no use
+  for — nothing here touches Yarn — and would need chasing again on the next rotation.
+- **Rejected: pin an older base image tag.** Leaves the codespace on a stale Python/tooling
+  base to dodge one bad apt line, and the tag would drift out from under us anyway.
+- **Rejected: `postCreateCommand` cleanup.** Runs *after* features install, i.e. after the
+  failure. Wrong lifecycle stage.
+
 ### Open
 - The dev container is committed but **unexercised** — Phase 2 verification is still the
-  next action, now runnable.
+  next action, runnable once the codespace rebuilds on the Dockerfile fix.
 - Whether 8 GB holds up once Spark and Airflow join the stack in P4.
 
 ---
