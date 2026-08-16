@@ -57,9 +57,10 @@ gateway, buffered in **Kafka**, and split into two paths from one topic:
 Each phase must pass its verification routine before the next begins.
 
 - [x] **Phase 1** — Validation gateway (FastAPI + Pydantic, 422 on bad input)
-- [ ] **Phase 2** — Kafka cluster + gateway producer + replay simulator (`tlc-raw-events`)
-- [ ] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
-- [ ] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet
+- [x] **Phase 2** — Kafka cluster + gateway producer + replay simulator (`tlc-raw-events`)
+- [x] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
+- [ ] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet *(planned; design
+      recorded in `docs/DECISIONS.md`)*
 - [ ] **Phase 5** — ML: train / predict / daily evaluation (Airflow-scheduled)
 - [ ] **Phase 6** — Streamlit dashboard (hot + cold + preds + alerts)
 
@@ -89,15 +90,17 @@ The TLC dataset is not in git. Download at least one month into the gitignored
 ```bash
 cd data_fetcher
 uv run python fetch.py                                  # just 2023-01 (~48 MB)
-uv run python fetch.py --start 2023-01 --end 2025-12    # full project scope
+uv run python fetch.py --start 2023-01 --end 2026-05    # full project scope (~2 GB)
 ```
 
-Re-running skips months already downloaded.
+Re-running skips months already downloaded, so an interrupted fetch resumes safely.
+The project scope is 2023-01 .. 2026-05 with the train/replay cutoff at 2025-12-31 —
+see `docs/DECISIONS.md` for why 2020–2022 is deliberately excluded.
 
 ### 2. Start the stack
 
 ```bash
-docker compose up -d kafka gateway
+docker compose up -d kafka gateway postgres hot_path
 ```
 
 ### 3. Replay records through it
@@ -117,6 +120,16 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic tlc-raw-events --from-beginning --max-messages 5
 ```
 
+### 5. Confirm the hot path is aggregating
+
+Rolling window metrics should appear — and keep updating — as the replay proceeds:
+
+```bash
+docker compose exec postgres psql -U northstar -d northstar -c \
+  "SELECT window_start, trip_count, avg_fare, is_final FROM window_metrics
+   WHERE zone_id IS NULL ORDER BY window_start DESC LIMIT 5;"
+```
+
 The gateway alone can still be run standalone (Phase 1 style), though it now needs a
 reachable broker:
 
@@ -126,4 +139,7 @@ cd gateway && uv sync && uv run uvicorn main:app
 
 ## Status
 
-Phase 1 complete. Phase 2 (Kafka + producer + simulator) built; verification pending.
+Phases 1–3 complete and verified end-to-end (validation gateway, Kafka + producer +
+replay simulator, hot path -> PostgreSQL). Phase 4 (cold path: Airflow + Spark ->
+partitioned Parquet) is designed but not yet built — the full plan, including rejected
+alternatives, is in `docs/DECISIONS.md`.

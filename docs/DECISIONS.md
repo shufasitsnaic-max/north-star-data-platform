@@ -526,6 +526,250 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ---
 
+## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
+
+**Status: PLANNED — nothing in this section is implemented yet.** Recorded before writing
+code so the design survives a lost chat session. Anything here may still change during
+implementation; the entry gets a `VERIFIED` status and a verification run appended when P4
+actually passes. Read it as intent, not as a description of the repo.
+
+### The conceptual correction worth keeping (cold path != old data)
+
+The tempting mental model — *hot path handles new data, cold path handles old data* — is
+**wrong**, and it describes a data warehouse rather than a lambda architecture. Recording
+the right framing because it drives the design and it's the presentation angle:
+
+Both layers process **the same events**. Every replayed 2026 trip goes through the hot path
+(~1s, 5-minute in-memory windows, drops late events past grace, loses open windows on
+restart) *and* through the cold path (minutes later, full recompute from the log, every
+event every time, rerunnable). The split is **latency vs. completeness**, not old vs. new.
+The cold path's job is to be the number you trust when the two disagree — which is what
+makes P3's documented compromises acceptable rather than defects.
+
+The 2023–2025 bulk load is a **third thing**: a historical backfill supplying the training
+corpus and the dashboard's long-run trends. It reuses the same Spark code and the same lake,
+but it is *not* what makes the cold path "cold".
+
+### Ingestion topology — hybrid: bulk load + bus
+
+Two writers into one lake:
+
+```
+data/raw/*.parquet ──[backfill DAG, one-shot, <= cutoff]──┐
+                                                          ├──> /data/lake/trips/year=/month=/day=
+Kafka tlc-raw-events ─[incremental DAG, sched, > cutoff]──┘     (canonical schema, Snappy Parquet)
+```
+
+- **Rejected: Kafka-only (cold path reads solely from the bus).** Architecturally purest —
+  the lake would contain only what actually transited the message bus. Killed by arithmetic:
+  P2 measured replay at ~420 events/sec, so pushing the 36-month training corpus through the
+  gateway would take **days**, and the lake would additionally be bounded by Kafka retention.
+  A training corpus that can only be built by a multi-day replay is not a training corpus.
+- **Rejected: Spark reads `data/raw` directly, Kafka feeds only the hot path.** Simplest and
+  fastest to build, and rejected on principle: the cold path would then know raw TLC column
+  names, directly violating the CLAUDE.md rule that nothing downstream of the adapter may
+  reference a specific source. It also makes the lambda story *untrue* — hot and cold would
+  no longer be two views of the same events.
+- **Chosen: hybrid.** The bulk loader is a **sibling of the gateway, not something downstream
+  of it** — it is an adapter invocation, which is exactly what the source-independence rule
+  permits. Everything past the lake still sees canonical columns only.
+
+### The cost of the hybrid: two adapter implementations
+
+`gateway/adapters/tlc_adapter.py` is row-at-a-time Pydantic. Spark cannot use it at 110M-row
+scale without a per-row Python UDF (slow, and it would force `gateway/` source into the
+`batch_jobs/` image, breaking the per-component dependency rule). So `batch_jobs/adapters/
+tlc_batch_adapter.py` reimplements the same mapping as **vectorized Spark SQL column
+expressions**.
+
+This is a real cost, stated plainly: two implementations of one mapping, free to drift, is
+the exact failure the canonical contract exists to prevent. The mitigation is a
+**conformance test against a golden file**:
+
+1. Run ~200 real raw rows through the **actual running gateway**; capture the canonical JSON.
+2. Commit both halves as `batch_jobs/tests/fixtures/conformance.json`.
+3. The test runs those same raw rows through the Spark adapter and asserts field-by-field
+   equality against the recorded gateway output.
+
+- **Rejected: importing `adapt_tlc()` into the test.** One source of truth, but reintroduces
+  precisely the build-time coupling P3 rejected when it chose a tolerant reader over a shared
+  `contracts/` package. The golden file tests the gateway's *observed behaviour*, not its
+  source, so coupling is zero.
+- **Knowing exception to "don't commit data":** the fixture is ~150KB of derived test data,
+  not a raw dataset. Committed deliberately, because a fixture generated on demand would make
+  the test skippable, and a skippable drift guard guards nothing.
+- **Consequence worth noting:** because the batch adapter is pure Spark SQL with no Python
+  UDFs, Spark executors need no Python dependencies beyond stock pyspark. The worker image
+  stays trivial. The constraint pays for itself twice.
+
+### Recompute strategy — full rebuild, no offset tracking
+
+The Kafka -> lake job reads `startingOffsets: earliest` -> `endingOffsets: latest` on **every
+run**, and rewrites affected date partitions with `partitionOverwriteMode=dynamic`.
+
+- No offset bookkeeping, no watermark state, trivially idempotent, and a rerun repairs any
+  past mistake. This is not laziness — recomputing the world from the immutable log is what
+  the batch layer of a lambda architecture is *for*, and it's the property that lets the cold
+  path correct the hot path.
+- **Rejected: incremental reads with offsets persisted in an Airflow Variable or a Postgres
+  table.** Cheaper per run, but it re-adds exactly the state-management burden the batch layer
+  exists to avoid, and a bad offset silently produces a permanently wrong lake. At this data
+  size a full recompute is seconds.
+
+### The cutoff is a P4 decision, not a P5 one
+
+Because both writers use dynamic partition overwrite, overlapping date ranges would mean
+whichever job ran last silently clobbers the other's partitions. So the cutoff is enforced
+config, shared by both jobs: backfill owns `<= cutoff`, Kafka loader owns `> cutoff`. P5
+inherits the same value for the train/replay split — the two were always one decision. Value
+pinned in the cross-phase section: `2025-12-31T23:59:59`.
+
+### Deduplication — natural key, not `event_id`
+
+`event_id` is a fresh UUID minted per gateway request, so replaying the same month twice
+writes every trip twice with different IDs, and a full recompute from `earliest` faithfully
+preserves the duplication. Dedupe is therefore on the natural key
+`(pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, total_amount, provider_id)`.
+Practical payoff: re-replaying during a demo, or restarting a botched replay, is harmless.
+
+### Component layout
+
+```
+batch_jobs/
+├── schemas/canonical_spark.py    # canonical StructType — SOURCE-AGNOSTIC
+├── adapters/tlc_batch_adapter.py # the ONLY source-specific file in this component
+├── jobs/bulk_load.py             # raw parquet (<= cutoff) -> lake, ONE MONTH per invocation
+├── jobs/stream_to_lake.py        # Kafka (> cutoff) -> lake
+├── jobs/aggregate_daily.py       # lake -> daily x zone -> Postgres staging
+├── common/{spark,config}.py      # session builder w/ backoff; env-driven config
+└── tests/                        # conformance golden file + test
+orchestration/
+├── Dockerfile                    # apache/airflow + JDK + spark-submit client
+└── dags/{cold_path_backfill,cold_path_incremental}.py
+```
+
+- **`canonical_spark.py` declares an explicit `StructType`, never inferred.** Same
+  tolerant-reader reasoning as `hot_path/schemas.py`: the gateway can *add* a canonical field
+  without silently changing the lake's schema, and a *removed* field fails loudly instead of
+  quietly reading nulls.
+- Money as `DecimalType(12,2)`, matching the Pydantic `Decimal` and Postgres `numeric`. No
+  float anywhere in the money path, end to end.
+- `source_extras` stored as a **typed struct, not a JSON blob** — Phase 2 already flagged
+  `ratecode_id` as a P5 feature candidate, and a struct keeps it queryable without parsing.
+- **`bulk_load.py` processes one month per invocation** so Airflow can map over months and a
+  failed month retries alone instead of redoing 36.
+
+### Serving-table write: staging + merge
+
+`aggregate_daily.py` produces daily x zone rollups (count, revenue, avg fare/tip/distance,
+plus a `zone_id IS NULL` citywide row mirroring the hot path's shape) — roughly 1,250 days x
+~260 zones ~= **325k rows**, trivially small. Spark writes to a **staging** table; a separate
+SQL task merges with `INSERT ... ON CONFLICT DO UPDATE`.
+
+- **Rejected: `mode("overwrite")` on the serving table.** Spark's JDBC writer has no upsert,
+  and overwrite drops/recreates the table (losing indexes) or, with `truncate=true`, leaves
+  the dashboard reading an empty table for several seconds mid-write. Staging + merge is
+  atomic from the reader's side.
+- Note this is the **same absolute-upsert pattern P3 chose** for window metrics — one
+  consistent write discipline across both layers rather than two.
+
+### DAG shapes
+
+- **`cold_path_backfill`** — `schedule=None`, manual trigger, dynamic task mapping
+  (`.expand()`) over the 36 months `<= cutoff`. Run once.
+- **`cold_path_incremental`** — `stream_to_lake -> aggregate_daily -> merge_into_serving`.
+
+Three settings, each preventing a specific failure:
+- **`schedule="*/3 * * * *"` (wall clock), not `@daily`.** The replay compresses event time
+  ~366x, so a `@daily` DAG would fire **zero times** during a 10-minute demo while the
+  simulator burns through a year of event time. "Daily batch" is the story; a 3-minute cron
+  is the schedule. Same event-time-vs-wall-clock distinction P3 hit, biting differently.
+- **`catchup=False`.** Otherwise Airflow backfills a run for every 3-minute interval since the
+  start date — thousands of runs on first boot.
+- **`max_active_runs=1`.** Two overlapping full recomputes writing the same partitions race
+  and corrupt them.
+
+### Compose additions (approved 2026-08-16)
+
+Six new service definitions — five long-running, one one-shot (`airflow-init`, like
+`simulator`): `spark-master`, `spark-worker`, `airflow-postgres`, `airflow-init`,
+`airflow-scheduler`, `airflow-webserver`. New volumes `airflow-db-data`, `airflow-logs`; new
+bind mounts `./data/lake` (rw into scheduler + master + worker) and `./data/raw:ro`.
+
+- **Spark master UI moved to 8081** — 8080 is Airflow's webserver.
+- **Dedicated `airflow-postgres` rather than a second database inside the serving
+  `postgres`.** One concern per container, and it means dropping the serving-store volume
+  can't take Airflow's history with it. Rejected the shared-instance variant on that coupling
+  alone; the extra container is cheap.
+- **Airflow metadata, Spark cluster, and the lake each get an explicit mount**, per the
+  no-ephemeral-state rule.
+- **Estimated ~10.5GB resident** with the full stack up, so the codespace moves from
+  2-core/8GB to **4-core/16GB** (`standardLinux32gb`). This resolves the "whether 8 GB holds
+  up once Spark and Airflow join" item left open in the dev-environment entry: it does not.
+  Cost: Student-pack core-hours burn at 2x.
+
+Three gotchas to bake in from the start, each an hour lost if discovered live:
+1. **`spark.driver.host=airflow-scheduler` + `spark.driver.bindAddress=0.0.0.0`.** In client
+   mode executors connect *back* to the driver; without this Spark advertises an unreachable
+   internal hostname and executors hang. The single most common Spark-on-Compose failure.
+2. **Bake the Kafka and Postgres JDBC jars into the image; never `--packages` at runtime.**
+   `--packages` resolves from Maven on every run and needs a warm Ivy cache — a classic
+   container flake with no useful error message.
+3. **Airflow deps via `pip --constraint`, not uv.** A deliberate, knowing exception to the
+   per-component uv rule. Airflow publishes a curated constraint set for its ~90 transitive
+   dependencies; resolving them independently is the standard route to an unbootable
+   scheduler. Recorded here so a future reader sees an exception, not an oversight. Every
+   other component keeps uv.
+
+**Why client mode over cluster mode:** cluster mode requires the application file to be
+present on the workers and loses the driver's stdout, whereas `SparkSubmitOperator` in client
+mode streams driver logs straight into the Airflow task log — which is genuinely useful for
+the demo (the Spark job's output is visible inside Airflow).
+
+**Honest caveat to state out loud in the presentation:** `./data/lake` is a shared local bind
+mount. On a real cluster this would be S3 or HDFS. It is the one place the "distributed"
+story is simulated, and Spark itself is admittedly oversized for ~45MB/month — the argument
+for it is that the code is unchanged at 45GB, not that this data needs a cluster.
+
+### Verification plan (must pass before P5)
+
+- **CLAUDE.md's stated check:** `pyarrow.parquet.ParquetFile('/data/lake/trips/...').metadata`
+  asserts schema + `year=/month=/day=` partitions.
+- **Conformance test green** — both adapters agree on 200 real rows.
+- **Cross-layer reconciliation** (the one that actually proves something): for a date the
+  simulator has replayed, sum `trip_count` from the hot path's `window_metrics` and compare
+  against the cold path's `cold_daily_zone_metrics`. Two independent code paths over the same
+  events. A small divergence is **expected and explainable** — it is the hot path's late-event
+  drops — and explaining the gap is worth more than the numbers matching exactly.
+- **Idempotency proof:** run `cold_path_incremental` twice back to back; row counts unchanged.
+  Demonstrates dedupe + dynamic partition overwrite together.
+
+### Build order
+
+Front-loads the component most likely to be wrong (the adapter), defers the heaviest infra:
+
+1. `canonical_spark.py` + `tlc_batch_adapter.py` + conformance test *(local Spark, no cluster)*
+2. `bulk_load.py` + `spark-master`/`spark-worker` — verify on **3 months**, not 36
+3. `stream_to_lake.py`
+4. `aggregate_daily.py` + staging/merge
+5. `orchestration/` image + both DAGs + Airflow services
+6. Full 36-month backfill, verification run, this entry updated to `VERIFIED`
+
+### Open
+
+- **Simulator footgun:** setting `START_DATETIME` without `START_MONTH` makes `build_dataset`
+  load and globally sort all 41 months (~120M rows) and OOM. `discover_files()` already
+  supports the range flags, so the fix is a ~3-line default deriving `start_month` from
+  `start_datetime`. In scope for P4 since P4 is what makes 41 months present.
+- Whether TLC has actually published through 2026-05 at fetch time. If the last month or two
+  are missing, the cutoff still holds; the replay just has less runway.
+- 36 months is ~110M rows — more than scikit-learn will want to train on directly. Sampling
+  strategy is a P5 problem, flagged here because it's a consequence of this scope choice.
+- Disk: ~2GB of parquet plus ~3.5GB of Spark/Airflow images against the codespace's 32GB.
+  Should fit; unmeasured.
+
+---
+
 ## Open / deferred decisions (cross-phase)
 
 - **ML task.** Per-trip **tip prediction** is the core model: train on <=cutoff records,
@@ -537,12 +781,19 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
   replaying post-cutoff records in `pickup_datetime` order. Batch vs stream is a
   freshness-vs-completeness tradeoff (lambda architecture) over the *same* events.
   <=cutoff trains the model (batch), >cutoff replays as the stream.
-- **Data scope: 2023–2025 only (post-COVID).** Decided 2026-08-16. Deliberately exclude
-  2020–2022: pandemic-era ridership is a regime shift (collapsed volumes, distorted
+- **Data scope: 2023-01 .. 2026-05 (post-COVID).** Originally recorded as "2023–2025 only";
+  **extended forward to 2026-05 on 2026-08-16**, which is the last month TLC has published.
+  The exclusion that matters is unchanged and still deliberate: **2020–2022 stays out**,
+  because pandemic-era ridership is a regime shift (collapsed volumes, distorted
   zone/fare/tip patterns) the model would wrongly learn as signal, hurting predictions on
-  normalized traffic. 2023–2025 is a consistent post-recovery regime. Cutoff for the
-  train/replay split lands inside this range (exact month TBD in P5 — likely end-2023 or
-  mid-2024, leaving enough post-cutoff months to make a visible replay stream).
+  normalized traffic. Extending the *upper* bound doesn't touch that reasoning — it only
+  buys more post-cutoff months to replay.
+- **Cutoff pinned: `2025-12-31T23:59:59`.** Decided 2026-08-16, in P4 rather than P5,
+  because the cold path needs it first (see Phase 4 — it partitions which writer owns which
+  dates). 41 months total splits into **36 months ≤ cutoff** (~110M rows, the training
+  corpus) and **5 months > cutoff** (2026-01..05, ~15M rows ≈ 10h of replay at `SLEEP=0`) —
+  enough runway that a demo never runs dry. It also lands on a calendar-year boundary, which
+  makes the story easy to tell: *"the model has seen through 2025; 2026 is arriving live."*
 - **Data acquisition = a separate on-demand fetcher module.** TLC publishes monthly
   yellow-trip parquet files. A dedicated `data_fetcher/` component downloads the chosen
   months once into gitignored `/data/`, idempotently (skip files already present). It is
