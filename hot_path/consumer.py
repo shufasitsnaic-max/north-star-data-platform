@@ -68,6 +68,12 @@ def _config() -> dict:
         # First run has no committed offset: start at the beginning so a replay
         # that already happened is still aggregated.
         "auto.offset.reset": "earliest",
+        # The topic is created by the gateway's first produce, so the hot path
+        # legitimately starts before it exists. The default 5-minute metadata
+        # refresh would leave the consumer idle for minutes after a replay
+        # begins; 10s picks the topic up promptly at negligible cost on a
+        # single-broker cluster.
+        "topic.metadata.refresh.interval.ms": 10_000,
     }
 
 
@@ -122,17 +128,34 @@ def main() -> int:
 
     malformed = 0
     last_flush = time.monotonic()
+    # UNKNOWN_TOPIC_OR_PART repeats on every poll until the first replay creates
+    # the topic. Log it once as a waiting state rather than a wall of errors.
+    awaiting_topic = False
 
     try:
         while not _shutdown:
             message = consumer.poll(1.0)
 
             if message is not None:
-                if message.error():
+                code = message.error().code() if message.error() else None
+
+                if code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    # Expected before the gateway's first produce creates the
+                    # topic. Not an error — a waiting state. Announced once.
+                    if not awaiting_topic:
+                        logger.info(
+                            "topic %s does not exist yet — waiting for the first replay "
+                            "to create it (metadata refreshes every 10s)", _TOPIC,
+                        )
+                        awaiting_topic = True
+                elif message.error():
                     # EOF is informational on some builds, not a failure.
-                    if message.error().code() != KafkaError._PARTITION_EOF:
+                    if code != KafkaError._PARTITION_EOF:
                         logger.error("consume error: %s", message.error())
                 else:
+                    if awaiting_topic:
+                        logger.info("topic %s is now available — consuming", _TOPIC)
+                        awaiting_topic = False
                     try:
                         event = TripEventView.model_validate_json(message.value())
                         store.add(event, message.partition(), message.offset())
