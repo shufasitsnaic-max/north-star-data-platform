@@ -43,12 +43,19 @@ RUN set -eux; \
 # batch_jobs/pyproject.toml and the spark image tags move.
 #
 # Installed here rather than with ghcr.io/devcontainers/features/java, which was
-# tried first and left `java: command not found`. That feature installs into
-# SDKMAN and reaches PATH only via a *nested* containerEnv reference
-# (${SDKMAN_DIR}/candidates/java/current/bin:${PATH}); this devcontainer.json
-# also overrides PATH in remoteEnv for uv, and the two layers don't compose
-# reliably. apt's openjdk registers /usr/bin/java through alternatives, so it is
-# on PATH by construction and needs no plumbing at all.
+# tried first and left `java: command not found`.
+#
+# Why it failed was never actually established — the diagnostic went unrun and
+# the rebuild that replaced the feature destroyed the evidence. The leading
+# suspect is PATH: that feature installs into SDKMAN and reaches PATH only via a
+# *nested* containerEnv reference
+# (${SDKMAN_DIR}/candidates/java/current/bin:${PATH}), while this
+# devcontainer.json separately overrides PATH in remoteEnv for uv. Plausible,
+# unconfirmed, and recorded as such.
+#
+# What is not in doubt is why this route is better: apt's openjdk registers
+# /usr/bin/java through alternatives, so it is on PATH by construction and has
+# no plumbing that can silently fail to compose.
 #
 # Same reasoning that put the Yarn fix in this file: a step we control beats a
 # feature we have to debug from inside a container we can't ssh into.
