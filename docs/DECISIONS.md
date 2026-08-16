@@ -290,32 +290,55 @@ Airflow all run under Compose exactly as designed.
 - **Default 2-core / 8 GB machine.** Enough for Kafka + gateway. Revisit at P4 when Spark
   and Airflow land — a 4-core machine burns included core-hours twice as fast.
 
-### Build fix — the base image needed wrapping in a Dockerfile
-First codespace create **failed**, landing in the Alpine recovery container with no Docker
-daemon. Cause: `mcr.microsoft.com/devcontainers/python:1-3.11-bookworm` ships a
+### Build fix — the base image wrapped in a Dockerfile
+**Observed directly:** `mcr.microsoft.com/devcontainers/python:1-3.11-bookworm` ships a
 preconfigured Yarn apt source (`dl.yarnpkg.com`) whose signing key has since rotated, so
-every `apt-get update` in the image fails with `NO_PUBKEY 62D54FD4003F6525`. Dev container
-*features* run `apt-get update` during their install, so `docker-in-docker` aborted with
-exit 100 and took container creation down with it.
+`apt-get update` in the image fails with `NO_PUBKEY 62D54FD4003F6525`. This is a real defect
+and it matters here, because dev container *features* run `apt-get update` during their
+install — so a broken apt source can take `docker-in-docker` down with it.
 
 **Decision: wrap the base image in `.devcontainer/Dockerfile`** that deletes the Yarn apt
 source, then runs `apt-get update` under `set -e` to prove apt is healthy. `devcontainer.json`
 switches from `"image"` to `"build".dockerfile`. Matching on the URL rather than a filename
 keeps it correct whether the image uses legacy `.list` or deb822 `.sources` format, and the
 verification step means a still-broken repo fails loudly at image build instead of inside an
-opaque feature-install step.
+opaque feature-install step. Retained as a cheap guard against a defect we know is present.
 
 - **Rejected: import the rotated Yarn key.** Chases an upstream key this project has no use
   for — nothing here touches Yarn — and would need chasing again on the next rotation.
 - **Rejected: pin an older base image tag.** Leaves the codespace on a stale Python/tooling
   base to dodge one bad apt line, and the tag would drift out from under us anyway.
-- **Rejected: `postCreateCommand` cleanup.** Runs *after* features install, i.e. after the
-  failure. Wrong lifecycle stage.
+- **Rejected: `postCreateCommand` cleanup.** Runs *after* features install, i.e. too late to
+  protect a feature install. Wrong lifecycle stage.
+
+### Correction — the "codespace is in a recovery container" diagnosis was wrong
+An earlier version of this entry (commit `c5aba52`) claimed the first codespace create failed
+into an Alpine recovery container with no Docker daemon, and that the Yarn source caused it.
+**That causal claim was not supported by evidence and is retracted.**
+
+The diagnosis rested entirely on `gh codespace ssh` failing with *"Please check if an SSH
+server is installed in the container."* That error is **not** evidence of a failed build.
+`gh codespace ports` against the same codespace returns our own `portsAttributes` labels —
+`gateway (FastAPI)` on 8000, `kafka (host listener)` on 9092 — which only exist in our
+`devcontainer.json`. The container therefore built with our config and was healthy the whole
+time; a recovery container would never have applied those labels.
+
+**Lesson worth keeping: an unreachable container is not a broken container.** Diagnose
+container health with a check that doesn't share a transport with the symptom. Two codespaces
+were stopped/created chasing this before `ports` was tried.
+
+- **Real open issue:** `gh codespace ssh` does not reach these codespaces, so the stack cannot
+  be driven from a local terminal. P2 is therefore verified from the browser web editor.
+  Adding `ghcr.io/devcontainers/features/sshd:1` is the candidate fix if CLI access is wanted
+  later — deferred rather than adopted, since it is a new feature dependency and the browser
+  path unblocks P2 today.
 
 ### Open
-- The dev container is committed but **unexercised** — Phase 2 verification is still the
-  next action, runnable once the codespace rebuilds on the Dockerfile fix.
+- The dev container is committed but **unexercised** — Phase 2 verification is the next
+  action, run from the browser terminal in codespace `northstar-p2`.
 - Whether 8 GB holds up once Spark and Airflow join the stack in P4.
+- Whether the Yarn apt breakage would actually have broken the `docker-in-docker` install
+  here. The Dockerfile now prevents it, so this stays untested by design.
 
 ---
 
