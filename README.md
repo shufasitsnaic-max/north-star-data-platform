@@ -60,7 +60,7 @@ Each phase must pass its verification routine before the next begins.
 - [x] **Phase 2** — Kafka cluster + gateway producer + replay simulator (`tlc-raw-events`)
 - [x] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
 - [x] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet, daily aggregates -> PostgreSQL
-- [ ] **Phase 5** — ML: train / predict / daily evaluation (Airflow-scheduled)
+- [x] **Phase 5** — ML: fare estimation at pickup, scored live, evaluated daily by Airflow
 - [ ] **Phase 6** — Streamlit dashboard (hot + cold + preds + alerts)
 
 ## Getting started
@@ -138,8 +138,15 @@ cd gateway && uv sync && uv run uvicorn main:app
 
 ## Status
 
-Phases 1–4 complete and verified end-to-end: validation gateway, Kafka + producer +
-replay simulator, hot path -> PostgreSQL, and the full cold path.
+Phases 1–5 complete and verified end-to-end: validation gateway, Kafka + producer +
+replay simulator, hot path -> PostgreSQL, the full cold path, and the ML layer.
+
+**Phase 5 (ML) estimates what a ride will cost, before it starts** — the upfront-pricing
+question a rider actually asks. It uses only what is known at pickup: the two zones and
+the clock, never the distance driven or the meter reading. On normal days it lands
+within **$4.36-$4.94** of the real price against **$3.91** in training. On New Year's Day
+its R2 collapses to **0.025** — the daily evaluation caught a real model weakness, with a
+nameable fix, on its first run.
 
 **Phase 4 (cold path) is done.** Airflow runs both DAGs unattended — a one-shot backfill
 that mapped 12 months of history into the lake, and a recurring pipeline that recomputes

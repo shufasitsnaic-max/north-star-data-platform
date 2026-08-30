@@ -1295,7 +1295,8 @@ decision taken today; the remaining months need only an extended list and a re-t
 
 ## Phase 5 — ML: fare estimation at pickup  · 2026-08-30
 
-**Status: IN PROGRESS — trained and scoring; daily evaluation not yet run end to end.**
+**Status: VERIFIED end-to-end 2026-08-30.** Trained, scoring the replayed stream, and
+evaluated daily by Airflow.
 
 ### The task changed, and why
 
@@ -1439,6 +1440,64 @@ Three compounding limits, all of which resolve with more replay:
 Consequence: the pooled `avg_predicted` / `avg_actual` figures are not a fair summary of
 the model. The per-day `ml_daily_eval` rows are unaffected, since they group by event-time
 date. Do not quote a headline forward MAE until a longer replay has run.
+
+### Verification run
+
+204,944 predictions over four event-time days, evaluated by `ml_daily_eval`:
+
+| day | predictions | MAE | RMSE | MAPE | R2 |
+|-----|-------------|-----|------|------|-----|
+| 2026-01-01 *(New Year's Day)* | 39,250 | **$13.73** | $22.38 | 31.7% | **0.025** |
+| 2026-01-02 | 19,561 | $4.94 | $11.51 | 17.5% | 0.713 |
+| 2026-01-03 | 105,737 | $4.50 | $10.58 | 16.8% | 0.732 |
+| 2026-01-04 | 40,396 | $4.36 | $10.19 | 16.0% | 0.737 |
+
+**The model generalises forward.** Normal days sit at $4.36-$4.94 against a training MAE of
+$3.91 — the mild degradation expected on genuinely unseen data, on a chronological holdout
+rather than a random one.
+
+**The holiday failure is sharper than MAE alone suggests.** New Year's Day is 3.1x the error,
+but the number to quote is **R2 = 0.025**: on that day the model explains essentially none of
+the variance in price. It is no better than guessing the average. Every other day sits at
+0.71-0.74.
+
+Note `predictions` for 2026-01-01 is double its true trip count, because that day was
+replayed twice during P4 step 3's dedupe test and the predictor does not dedupe (the gateway
+mints a fresh `event_id` per request). The error metrics are unaffected — duplicates are
+identical trips, so they do not move an average — but the count is not a trip count.
+
+### Two bugs found by running it
+
+- **The predictor could not keep up with its own input.** Measured ~120 events/sec against a
+  replay producing ~420/sec, so it fell steadily behind and a 205k re-score was heading for
+  half an hour. `model.predict()` was being called on a **one-row DataFrame per event**,
+  paying the whole pipeline's fixed cost — encoder transform plus booster setup — for a
+  single number. The database writes were already batched; the model call, the expensive
+  half, was not. Now one `predict()` per batch, through the same `build_features` path, so a
+  batch of N and a batch of 1 remain identical code. Worth noting *why* it surfaced: only a
+  re-score made throughput visible. In normal operation the service would have drifted
+  further behind the replay with nothing reporting it.
+- **Evaluating during a re-score produces incoherent rows.** The first evaluation ran while
+  the predictor was rewriting `fare_predictions` with v2, and produced per-version rows that
+  did not partition — 16,650 v1 rows and 39,250 v2 rows for a day holding 39,250 predictions
+  in total. The evaluation is a full recompute over a table another service is actively
+  rewriting and has no way to know it. **Operational rule: evaluate after a re-score
+  finishes, never during.** Those rows were deleted; retired model versions are kept
+  deliberately (`model_version` is in the primary key precisely so two models' error series
+  stay separable), but only when they describe predictions that actually existed.
+
+### Open
+
+- **No holiday feature.** The named fix for the finding above. A calendar flag — public
+  holidays, and probably day-before/day-after — is the obvious next iteration, and the
+  clean way to show it would be a `fare-hgb-3` evaluated against v2 on the same days.
+- **Changing the model does not re-score anything.** The consumer group has already read
+  past those events, so rows keep their old prediction and old `model_version` until the
+  group is reset. The command is recorded in `predictor.py`; it is an operational step, not
+  something the code can infer.
+- **Four days of forward data.** Enough to separate the holiday from normal days, not enough
+  to characterise weekly or seasonal behaviour. The replay is capped by `MAX_ROWS`, not by
+  anything structural.
 
 ---
 

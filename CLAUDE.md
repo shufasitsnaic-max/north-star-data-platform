@@ -78,8 +78,10 @@ scaffold future phases early.
 - **P4 — Cold path** (done): `pyarrow.parquet.ParquetFile('/data/lake/...').metadata` asserts
   schema + `year=/month=/day=` partitions. Also verified: Airflow runs both DAGs unattended,
   and hot vs cold trip counts reconcile exactly on a single replay.
-- **P5 — ML:** train on <=cutoff; predictions written to Postgres; Airflow daily-eval DAG
-  compares predicted vs actual and records error metrics.
+- **P5 — ML** (done): fare estimation at pickup. Trains on <=cutoff, scores post-cutoff
+  events off the bus, and an Airflow DAG records daily predicted-vs-actual error. Verified:
+  normal-day MAE $4.36-$4.94 against $3.91 in training, and a New Year's Day R2 of 0.025 the
+  evaluation caught on its own.
 - **P6 — Dashboard:** Streamlit shows live hot metrics, cold historical trends,
   predicted-vs-actual, and anomaly alerts — refreshing as the simulator replays.
 
