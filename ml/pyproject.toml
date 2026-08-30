@@ -1,0 +1,39 @@
+# ML layer: trains on history, predicts on the replayed stream, and records
+# both so the daily evaluation can compare them.
+#
+# Its own uv project like every other component — no shared environment, no
+# requirements.txt (see CLAUDE.md).
+#
+# One image serves both `ml_train` and `ml_predictor` deliberately. A model
+# pickled by one scikit-learn version and unpickled by another is a real and
+# quiet failure mode; sharing an image makes the versions impossible to diverge.
+
+[project]
+name = "ml"
+version = "0.1.0"
+description = "Fare estimation: train on <=cutoff, predict on the replayed stream"
+requires-python = ">=3.11"
+dependencies = [
+    # The model. Pinned exactly: the artifact written by train.py is loaded by
+    # predictor.py, and scikit-learn does not promise pickle compatibility
+    # across versions.
+    "scikit-learn==1.6.0",
+    # Feature frames for training. The predictor builds single-row frames with
+    # the same code path, so both sides see identical column order and dtypes.
+    "pandas==2.2.3",
+    # Reads the lake directly, with partition pruning — no Spark needed to
+    # sample a training set.
+    "pyarrow==18.1.0",
+    # Model serialization. joblib rather than plain pickle: it is what
+    # scikit-learn's own docs recommend for estimators holding large arrays.
+    "joblib==1.4.2",
+    # Same client family and version as the gateway's producer and the hot
+    # path's consumer, so all three share one librdkafka generation.
+    "confluent-kafka==2.6.1",
+    # psycopg 3 with the prebuilt binary wheel. Maps Python Decimal <->
+    # PostgreSQL numeric without going through float, which is what keeps the
+    # money path exact.
+    "psycopg[binary]==3.2.3",
+    # Pinned to the gateway's version: both sides parse the same canonical JSON.
+    "pydantic==2.10.4",
+]

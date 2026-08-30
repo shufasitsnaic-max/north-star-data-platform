@@ -13,6 +13,10 @@ import pendulum
 # docker-compose.yml. The jobs are mounted read-only; only the lake is writable.
 JOBS = "/opt/batch_jobs/jobs"
 SQL = "/opt/batch_jobs/sql"
+# The ML layer's SQL, mounted separately. Only its .sql files are needed here:
+# the eval DAG runs pure SQL, so the scheduler image needs no scikit-learn and
+# the model artifact never has to leave the ml containers.
+ML_SQL = "/opt/ml/sql"
 
 # The serving store, reached through an Airflow connection supplied as
 # AIRFLOW_CONN_NORTHSTAR_PG in the environment rather than created by hand in

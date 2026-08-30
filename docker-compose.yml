@@ -9,6 +9,8 @@
 #   spark-master  — standalone Spark master for the cold-path jobs
 #   spark-worker  — the one executor host; scale with `--scale spark-worker=N`
 #   airflow-*     — metadata DB, one-shot init, scheduler, webserver (8080)
+#   ml_train      — one-shot fit, behind the "train" profile
+#   ml_predictor  — quotes a price for each post-cutoff event as it replays
 #
 # Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
 # Bring up the cold path:              docker compose up -d spark-master spark-worker
@@ -32,6 +34,10 @@
 # Airflow UI at http://localhost:8080 — admin/admin, development only.
 # Trigger the one-shot historical backfill:
 #   docker compose exec airflow-scheduler airflow dags trigger cold_path_backfill
+#
+# Train the fare model, then start scoring the replayed stream:
+#   docker compose run --rm ml_train
+#   docker compose up -d ml_predictor
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
@@ -384,6 +390,10 @@ services:
       # The jobs themselves, plus the launcher-time Spark config.
       - ./batch_jobs:/opt/batch_jobs:ro
       - ./batch_jobs/conf:/opt/spark-conf:ro
+      # Only the ML layer's SQL. The eval DAG runs pure SQL, so the scheduler
+      # needs neither scikit-learn nor the model artifact — the ML code and the
+      # orchestration image stay independent.
+      - ./ml/sql:/opt/ml/sql:ro
       # The driver reads Parquet metadata and commits the output even though
       # executors do the writing, so it needs the lake read-write and the raw
       # drop read-only — exactly like the Spark services.
@@ -430,6 +440,58 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  # -- ML layer --------------------------------------------------------------
+  # Both roles share one image, so the scikit-learn that pickles the model is
+  # necessarily the one that unpickles it.
+  ml_train:
+    build: ./ml
+    container_name: ml_train
+    command: ["python", "train.py"]
+    # Profiled, like `simulator`: training is a deliberate act, not something a
+    # bare `docker compose up` should trigger. Run it before the predictor:
+    #   docker compose run --rm ml_train
+    profiles: ["train"]
+    environment:
+      LAKE_PATH: /data/lake/trips
+      MODEL_DIR: /models
+      CUTOFF_DATETIME: ${CUTOFF_DATETIME:-2025-12-31T23:59:59}
+      TRAIN_SAMPLE_ROWS: ${TRAIN_SAMPLE_ROWS:-1500000}
+    volumes:
+      # The lake read-only: training reads history and must never alter it.
+      - ./data/lake:/data/lake:ro
+      # The artifact, on an explicit mount. A model that vanishes with the
+      # container is a cache, not a model.
+      - ./data/models:/models
+
+  ml_predictor:
+    build: ./ml
+    container_name: ml_predictor
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: tlc-raw-events
+      # Its own consumer group, so this service and the hot path each see every
+      # event instead of splitting the topic between them.
+      KAFKA_GROUP_ID: ml-predictor
+      MODEL_DIR: /models
+      # Must match the value training used, or the model would be scored on
+      # days it was fitted on.
+      CUTOFF_DATETIME: ${CUTOFF_DATETIME:-2025-12-31T23:59:59}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+    volumes:
+      # Read-only here: serving must never modify the artifact it is serving.
+      - ./data/models:/models:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # A worker, not a server: restart so a transient broker or database blip
+    # does not silently stop scoring.
     restart: unless-stopped
 
 volumes:

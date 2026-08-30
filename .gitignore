@@ -47,6 +47,12 @@ ENV/
 !/data/lake/
 /data/lake/*
 !/data/lake/.gitkeep
+# Same again for the model artifact directory: it is a bind-mount source,
+# so it must exist before the first `up` or Docker creates it as root and
+# training cannot write into it. Models themselves stay out of git.
+!/data/models/
+/data/models/*
+!/data/models/.gitkeep
 *.parquet
 *.arrow
 # Raw trip files (un-ignore a small sample below if you want one in-repo)
