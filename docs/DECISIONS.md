@@ -571,21 +571,21 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
 
-**Status: IN PROGRESS — steps 1-2 of 6 verified, steps 3-6 are still design.** The plan below
-was recorded *before* writing any code so it would survive a lost session; steps 3-6 remain
-intent rather than a description of the repo. What exists today is recorded under "Step 1"
-and "Step 2" near the end of this entry.
+**Status: IN PROGRESS — steps 1-3 of 6 verified, steps 4-6 are still design.** The plan below
+was recorded *before* writing any code so it would survive a lost session; steps 4-6 remain
+intent rather than a description of the repo. What exists today is recorded under "Step 1",
+"Step 2" and "Step 3" near the end of this entry.
 
-**Next action:** step 3, `stream_to_lake.py`. It inherits a verified adapter, schema, cluster
-and write path — the new risk is the Kafka connector JAR, not the Spark logic. Read the "four
-bugs" section under Step 2 first; bug 4 in particular changes how step 5's DAG must invoke
-spark-submit.
+**Next action:** step 4, `aggregate_daily.py` plus the Postgres staging/merge. Before writing
+step 5's DAG, read the bug sections under Steps 2 and 3: the DAG must set `SPARK_MASTER` in
+the task environment *and* pass `--packages` on the submit line, and confusing the two gives a
+silent no-op in one direction and a hard failure in the other.
 
 | # | Step | State |
 |---|------|-------|
 | 1 | canonical Spark schema + batch adapter + conformance test | **verified** 2026-08-30, `fba0137` |
 | 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | **verified** 2026-08-30 |
-| 3 | `stream_to_lake.py` (Kafka -> lake) | not started |
+| 3 | `stream_to_lake.py` (Kafka -> lake) | **verified** 2026-08-30 |
 | 4 | `aggregate_daily.py` + staging/merge into Postgres | not started |
 | 5 | `orchestration/` image + both DAGs + Airflow services | not started |
 | 6 | full 36-month backfill + verification run | not started |
@@ -992,6 +992,90 @@ testable and worked; the container config was pure assertion and did not.
 - **Row counts are larger than planned on:** ~3.5–4.3M per month, not ~3M. A 36-month backfill
   is therefore nearer 130M rows than 110M.
 
+### Step 3 — stream_to_lake: the cold path proper  · verified 2026-08-30
+
+`batch_jobs/jobs/stream_to_lake.py` plus `adapters/registry.py` and a mounted
+`batch_jobs/conf/spark-defaults.conf`. Reads the whole topic as a batch
+(`earliest` -> `latest`), filters to `> cutoff`, dedupes on the natural key, and
+rewrites the affected partitions. This is the half of the lake that recomputes
+events the hot path already saw; `bulk_load` remains a backfill of files that never
+transited the bus.
+
+Design decisions made during implementation:
+
+- **A registry, so a downstream job never names a source.** `source_extras` is stored
+  as a typed struct, so whoever writes the lake must know that struct's fields — but
+  this job sits downstream of the bus, where the core principle forbids source
+  knowledge. `adapters/registry.py` maps a source *name* to its `StructType`, and the
+  name arrives as `SOURCE_EXTRAS` configuration. Same arrangement already recorded for
+  `KAFKA_TOPIC`: configuration may know the source, code may not. Rejected importing
+  `TLC_SOURCE_EXTRAS` directly — two lines shorter, and it turns the swap story from
+  "new adapter plus a config value" into "new adapter plus edit every job". The
+  registry raises on an unknown name rather than defaulting to an empty struct, which
+  would write a lake whose physical schema disagrees with the other writer's and only
+  surface much later as a read error.
+- **Dedupe here, and deliberately the opposite call from `bulk_load`.** The gateway
+  mints a fresh `uuid4` per request, so a re-run replay arrives with new `event_id`s
+  and would double every number in the lake. `bulk_load` needs no equivalent because
+  partition overwrite already makes its reruns idempotent, and deduping there could
+  only destroy real rows. Two jobs, opposite choices, one reason: what a rerun means
+  differs between them.
+- **The dedupe's feared cost turned out to be zero, measured.** The concern was that
+  two genuinely distinct trips sharing all six key fields would collapse into one.
+  Measured against 2024-06 in the lake — 3,476,089 rows written by `bulk_load`, which
+  does not dedupe, so every row is a distinct raw record — **0 rows were collapsible,
+  0.0000%**. Six fields at second resolution make the natural key effectively unique.
+  Recorded because the tradeoff was accepted on judgement and is now backed by a
+  number.
+- **A missing topic is a waiting state, not a failure.** The topic is created by the
+  gateway's first produce, so before any replay there is legitimately nothing to read.
+  Matches how the hot path treats the same condition. Matched narrowly on known
+  markers; anything unrecognized re-raises rather than being swallowed.
+
+### The two bugs, and the distinction they turn on
+
+Both were launcher-versus-runtime confusions, and the second was self-inflicted by the
+fix for step 2's bug 2.
+
+1. **`Failed to find data source: kafka`.** The connector was declared through
+   `spark.jars.packages` on the session builder, reasoning by analogy with `spark.master`
+   after step 2's bug 4 showed submit-line flags being silently overridden here. **The
+   analogy is wrong.** `spark.master` is read when the session is built, so config can
+   own it. `spark.jars.packages` is read by SparkSubmit *before the JVM exists* — it
+   resolves through Ivy and builds the classpath — so setting it from inside a running
+   JVM silently does nothing. Same-looking `spark.*` key, different lifecycle. The
+   `packages` argument was removed rather than left as a knob that appears to work, and
+   the job now translates Spark's bare message into the submit command that fixes it.
+   **Consequence for step 5:** the DAG must pass `--packages` on the submit line *and*
+   set `SPARK_MASTER` in the task environment. Confusing the two produces a silent
+   no-op in one direction and a hard failure in the other.
+2. **`FileNotFoundException: /home/vscode/.ivy2/cache/resolved-...xml`.** A direct
+   consequence of mounting `/etc/passwd` in `159979a`. Java derives `user.home` from the
+   passwd entry rather than from `$HOME`, so making uid 1000 resolvable also gave it a
+   home directory that exists on the host and not in the `apache/spark` image — and the
+   `HOME=/tmp` already set on both services does not reach Ivy for that reason. Fixed by
+   pinning `spark.jars.ivy` in a mounted `spark-defaults.conf`, scoped explicitly to
+   settings that must exist before a JVM starts. Rejected adding another flag to every
+   submit command: step 5's DAG would have to remember it, and forgetting it fails at a
+   distance.
+
+`spark-defaults.conf` is now the third place Spark configuration lives, so the split is
+worth stating: `common/spark.py` owns anything a running session can set, this file owns
+anything needed before the JVM starts, and the submit line owns per-job connectors.
+
+### Verification run
+
+- **Dedupe, end to end.** Replayed 2026-01 twice (20,000 rows each, 19,625 accepted per
+  pass, 1.88% rejected). The job reported **39,250 post-cutoff events, 19,625 after
+  dedupe, 19,625 collapsed** — two replays producing a lake identical to one. A repeated
+  or botched demo replay is harmless.
+- **No false collapse in the single-replay case:** the first pass's 19,625 events deduped
+  to exactly 19,625, losing nothing.
+- **Two writers, one tree.** `year=2023`, `2024`, `2025` (bulk_load) and `year=2026`
+  (stream_to_lake) coexist under `data/lake/trips/` with neither clobbering the other —
+  the cutoff split working as designed.
+- Conformance suite still green after the `common/spark.py` and `common/config.py` edits.
+
 ### Open
 
 - **Resolved 2026-08-30:** step 1 is fully green, 7/7. The concern behind this item — that
@@ -1021,6 +1105,13 @@ testable and worked; the container config was pure assertion and did not.
 - **Step 5 is the remaining risk concentration.** Three new containers, an Airflow metadata DB
   and a spark-submit client image — the same blind-config surface that produced all four bugs
   above, roughly tripled. Check the base image's toolset *before* writing healthchecks.
+
+- **The Ivy cache lives only as long as the container.** Repeated submits reuse it;
+  recreating the container re-downloads the connector. A few seconds, accepted rather
+  than managing a bind mount's ownership. Revisit if step 5 recreates containers often.
+- **`stream_to_lake` reads the whole topic every run,** which is correct now and is
+  bounded by Kafka retention rather than by the lake. Worth re-measuring in step 6 once
+  a long replay has built up real topic volume.
 
 ---
 
