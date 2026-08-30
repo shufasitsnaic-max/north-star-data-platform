@@ -578,7 +578,7 @@ near the end of this entry.
 
 | # | Step | State |
 |---|------|-------|
-| 1 | canonical Spark schema + batch adapter + conformance test | **built**, `fba0137` |
+| 1 | canonical Spark schema + batch adapter + conformance test | **verified** 2026-08-30, `fba0137` |
 | 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | not started |
 | 3 | `stream_to_lake.py` (Kafka -> lake) | not started |
 | 4 | `aggregate_daily.py` + staging/merge into Postgres | not started |
@@ -606,9 +606,10 @@ cd /workspaces/north-star-data-platform ; docker compose run --rm simulator
 cd /workspaces/north-star-data-platform/batch_jobs ; uv run pytest -v
 ```
 
-**First action next session:** confirm step 1's test suite is fully green (7 tests). The
-final post-fix run was never pasted back — 5 of 6 passed before the fix, and the fix is
-believed complete but unconfirmed. Do not start step 2 on an unverified step 1.
+**Step 1 is confirmed green — 7/7 on 2026-08-30**, in 73s of local Spark. The
+null-vs-absent fix (`869df4b`) is real, not merely believed. Step 2 was unblocked by that
+run; the machine was also confirmed already on `standardLinux32gb` (4 cores / 15GB / 22GB
+free), so the sizing item under "Compose additions" needs no further action.
 
 ### The conceptual correction worth keeping (cold path != old data)
 
@@ -889,8 +890,9 @@ independent measurements converging on the same refund/void rate.
 
 ### Open
 
-- **Confirm step 1 is fully green.** 5 of 6 tests passed before the null-vs-absent fix; the
-  post-fix run (7 tests) was never pasted back. Believed complete, unverified.
+- **Resolved 2026-08-30:** step 1 is fully green, 7/7. The concern behind this item — that
+  the null-vs-absent fix might have broken one of the five previously-passing tests — did not
+  materialize.
 - **Fixed since this entry was written:** the simulator footgun. `iter_records()` now streams
   one month at a time instead of concatenating all 41 (`ce43357`) — a per-file sort still
   yields a globally ordered replay because the out-of-month filter keeps every row inside its
