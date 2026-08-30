@@ -59,8 +59,7 @@ Each phase must pass its verification routine before the next begins.
 - [x] **Phase 1** — Validation gateway (FastAPI + Pydantic, 422 on bad input)
 - [x] **Phase 2** — Kafka cluster + gateway producer + replay simulator (`tlc-raw-events`)
 - [x] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
-- [ ] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet *(in progress — step 1
-      of 6 built; full design and a resume checklist are in `docs/DECISIONS.md`)*
+- [x] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet, daily aggregates -> PostgreSQL
 - [ ] **Phase 5** — ML: train / predict / daily evaluation (Airflow-scheduled)
 - [ ] **Phase 6** — Streamlit dashboard (hot + cold + preds + alerts)
 
@@ -139,20 +138,30 @@ cd gateway && uv sync && uv run uvicorn main:app
 
 ## Status
 
-Phases 1–3 complete and verified end-to-end (validation gateway, Kafka + producer +
-replay simulator, hot path -> PostgreSQL).
+Phases 1–4 complete and verified end-to-end: validation gateway, Kafka + producer +
+replay simulator, hot path -> PostgreSQL, and the full cold path.
 
-**Phase 4 (cold path) is in progress.** Step 1 of 6 is built: `batch_jobs/` holds the
-canonical Spark schema, a vectorized TLC adapter, and a conformance test that pins that
-adapter to the gateway's own output. It needs no cluster, no Kafka and no database:
+**Phase 4 (cold path) is done.** Airflow runs both DAGs unattended — a one-shot backfill
+that mapped 12 months of history into the lake, and a recurring pipeline that recomputes
+the post-cutoff half from Kafka, rolls the whole lake up to daily x zone metrics, and
+merges them into the serving store. The lake holds 428 Snappy Parquet files partitioned
+`year=/month=/day=`; the serving table holds ~102k daily x zone rows.
+
+The result worth pointing at is the **cross-layer reconciliation**. Hot and cold are two
+independent code paths over the same events, and on a single clean replay their trip
+counts agree *exactly*. Where they diverge — a window replayed twice — the hot path
+over-counts duplicates it cannot dedupe while the cold path holds the true figure, which
+is precisely the property a lambda architecture exists to provide.
+
+The adapter's drift guard still runs with no cluster, no Kafka and no database:
 
 ```bash
 cd batch_jobs && uv run pytest -v
 ```
 
-Still to come: the bulk loader and Spark cluster, the Kafka -> lake job, daily
-aggregates, and the Airflow DAGs. The full design — with rejected alternatives and a
-resume checklist — is in `docs/DECISIONS.md`.
+The full design — including four infrastructure bugs worth reading before touching the
+Spark or Airflow config, and the launcher-versus-runtime distinction that caused two of
+them — is in `docs/DECISIONS.md`.
 
 **Data scope:** 2023-01 .. 2026-05, with the train/replay cutoff at 2025-12-31. Everything
 at or before the cutoff is backfilled from the raw files; everything after it arrives over
