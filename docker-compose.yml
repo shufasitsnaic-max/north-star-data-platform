@@ -8,6 +8,7 @@
 #   hot_path      — Kafka consumer -> event-time windows -> postgres
 #   spark-master  — standalone Spark master for the cold-path jobs
 #   spark-worker  — the one executor host; scale with `--scale spark-worker=N`
+#   airflow-*     — metadata DB, one-shot init, scheduler, webserver (8080)
 #
 # Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
 # Bring up the cold path:              docker compose up -d spark-master spark-worker
@@ -25,6 +26,12 @@
 #   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/aggregate_daily.py
 #   docker compose exec -T postgres psql -U northstar -d northstar -f - < batch_jobs/sql/schema.sql
 #   docker compose exec -T postgres psql -U northstar -d northstar -f - < batch_jobs/sql/merge_daily.sql
+#
+# Bring up orchestration (first run builds the image, a few minutes):
+#   docker compose up -d airflow-scheduler airflow-webserver
+# Airflow UI at http://localhost:8080 — admin/admin, development only.
+# Trigger the one-shot historical backfill:
+#   docker compose exec airflow-scheduler airflow dags trigger cold_path_backfill
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
@@ -283,6 +290,142 @@ services:
     # silently leave the cluster with no executors.
     restart: unless-stopped
 
+  # -- Orchestration: Airflow ------------------------------------------------
+  # Four services, matching the plan recorded on 2026-08-16. The Spark driver
+  # runs inside airflow-scheduler in client mode, which is why that service
+  # carries the lake mounts, the JDK and the Spark env the cluster services do.
+  #
+  # All three Airflow containers run as uid 1000 with the host passwd mounted,
+  # for the same two reasons the Spark services do: files written into the lake
+  # must be owned by the dev-container user, and Hadoop's login module needs the
+  # uid to resolve to a name or it dies before Spark starts.
+  airflow-postgres:
+    image: postgres:16-alpine
+    container_name: airflow-postgres
+    environment:
+      # Airflow's own metadata, deliberately NOT in the serving `postgres`.
+      # One concern per container, and dropping the serving volume must not be
+      # able to take Airflow's run history with it.
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  airflow-init:
+    build: ./orchestration
+    container_name: airflow-init
+    # One-shot, like `simulator`: it migrates the metadata schema and creates
+    # the admin user, then exits. Both operations are idempotent, so re-running
+    # `docker compose up` is harmless.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        # The logs volume is created by Docker as root; uid 1000 cannot write
+        # into it until it is handed over. Done here rather than in the image
+        # because the volume does not exist at build time.
+        mkdir -p /opt/airflow/logs
+        airflow db migrate
+        airflow users create --username admin --password admin           --firstname admin --lastname admin --role Admin --email admin@example.com           || echo "admin user already exists"
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      # The example DAGs would triple the DAG list and obscure ours.
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # The serving store, supplied as an environment connection rather than
+      # created in the UI: a connection that lives only in the metadata database
+      # is invisible in this repository and vanishes with the volume.
+      AIRFLOW_CONN_NORTHSTAR_PG: postgres://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-northstar}@postgres:5432/${POSTGRES_DB:-northstar}
+    user: "1000:0"
+    volumes: &airflow-common-volumes
+      - ./orchestration/dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+      - /etc/passwd:/etc/passwd:ro
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+  airflow-scheduler:
+    build: ./orchestration
+    container_name: airflow-scheduler
+    command: scheduler
+    environment:
+      <<: *airflow-common-env
+      # --- Spark client settings, only meaningful on this service ---
+      # The jobs read this; spark-submit's --master would be silently ignored
+      # because common/spark.py calls .master() explicitly.
+      SPARK_MASTER: spark://spark-master:7077
+      # Points the Spark client at our spark-defaults.conf. Without it the
+      # driver gets neither the Ivy cache path nor the connector packages, and
+      # reproduces both step-3 bugs inside a new container.
+      SPARK_CONF_DIR: /opt/spark-conf
+      # In client mode the executors connect *back* to the driver, which lives
+      # in this container. Without this Spark advertises an unreachable
+      # hostname and every task hangs until it times out.
+      SPARK_DRIVER_HOST: airflow-scheduler
+      # --- serving store, for aggregate_daily's JDBC write ---
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
+    user: "1000:0"
+    volumes:
+      - ./orchestration/dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+      - /etc/passwd:/etc/passwd:ro
+      # The jobs themselves, plus the launcher-time Spark config.
+      - ./batch_jobs:/opt/batch_jobs:ro
+      - ./batch_jobs/conf:/opt/spark-conf:ro
+      # The driver reads Parquet metadata and commits the output even though
+      # executors do the writing, so it needs the lake read-write and the raw
+      # drop read-only — exactly like the Spark services.
+      - ./data/lake:/data/lake
+      - ./data/raw:/data/raw:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-webserver:
+    build: ./orchestration
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      # 8080 is Airflow's; the Spark master UI was moved to 8081 for this.
+      - "8080:8080"
+    environment: *airflow-common-env
+    user: "1000:0"
+    volumes: *airflow-common-volumes
+    healthcheck:
+      # stdlib rather than curl. The Airflow image very likely ships curl, but
+      # "very likely" is exactly the assumption that produced a healthcheck the
+      # apache/spark image could never run — and a webserver that never reports
+      # healthy is a confusing failure. Python is guaranteed present here.
+      # Same shape as the gateway's check.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   kafka-data:
+  # Airflow's metadata and task logs, both explicit per the
+  # no-ephemeral-state rule. Losing logs loses the record of what ran.
+  airflow-db-data:
+  airflow-logs:
   postgres-data:

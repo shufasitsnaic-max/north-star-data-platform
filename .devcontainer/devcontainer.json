@@ -44,7 +44,7 @@
   // Ports for the phases that exist today. Later phases add their own
   // (Airflow 8080 arrives with P4 step 5, Streamlit 8501 in P6) — not
   // pre-declared here, per the no-scaffolding-ahead rule in CLAUDE.md.
-  "forwardPorts": [8000, 9092, 5432, 8081],
+  "forwardPorts": [8000, 9092, 5432, 8081, 8080],
   "portsAttributes": {
     "8000": { "label": "gateway (FastAPI)", "onAutoForward": "notify" },
     "9092": { "label": "kafka (host listener)", "onAutoForward": "silent" },
@@ -52,7 +52,10 @@
     // Spark's master UI is on 8081, not its usual 8080, which Airflow claims.
     // Useful during a backfill: it shows whether the job actually reached the
     // cluster or is quietly running in the driver's local mode.
-    "8081": { "label": "spark master UI", "onAutoForward": "notify" }
+    "8081": { "label": "spark master UI", "onAutoForward": "notify" },
+    // Airflow's webserver. Log in with admin/admin — development credentials,
+    // created by airflow-init and never used anywhere real.
+    "8080": { "label": "airflow (webserver)", "onAutoForward": "notify" }
   },
 
   // uv is the per-component dependency manager for this repo (no
