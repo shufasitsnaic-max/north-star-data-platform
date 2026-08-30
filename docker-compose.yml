@@ -12,8 +12,11 @@
 # Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
 # Bring up the cold path:              docker compose up -d spark-master spark-worker
 # Trigger a replay when you're ready:  docker compose run --rm simulator
-# Backfill one month into the lake:
-#   docker compose exec spark-master /opt/spark/bin/spark-submit #     --master spark://spark-master:7077 /opt/batch_jobs/jobs/bulk_load.py --month 2023-01
+# Backfill one month into the lake. Note SPARK_MASTER, not `--master`:
+# common/spark.py calls .master(config.SPARK_MASTER), and a builder's explicit
+# .master() overrides whatever spark-submit was given, so the flag is silently
+# ignored and the job runs local[*] inside this container.
+#   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/bulk_load.py --month 2023-01
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 

@@ -571,15 +571,20 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
 
-**Status: IN PROGRESS — step 1 of 6 built, the rest is still design.** The plan below was
-recorded *before* writing any code so it would survive a lost session; steps 2-6 remain
+**Status: IN PROGRESS — steps 1-2 of 6 verified, steps 3-6 are still design.** The plan below
+was recorded *before* writing any code so it would survive a lost session; steps 3-6 remain
 intent rather than a description of the repo. What exists today is recorded under "Step 1"
-near the end of this entry.
+and "Step 2" near the end of this entry.
+
+**Next action:** step 3, `stream_to_lake.py`. It inherits a verified adapter, schema, cluster
+and write path — the new risk is the Kafka connector JAR, not the Spark logic. Read the "four
+bugs" section under Step 2 first; bug 4 in particular changes how step 5's DAG must invoke
+spark-submit.
 
 | # | Step | State |
 |---|------|-------|
 | 1 | canonical Spark schema + batch adapter + conformance test | **verified** 2026-08-30, `fba0137` |
-| 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | not started |
+| 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | **verified** 2026-08-30 |
 | 3 | `stream_to_lake.py` (Kafka -> lake) | not started |
 | 4 | `aggregate_daily.py` + staging/merge into Postgres | not started |
 | 5 | `orchestration/` image + both DAGs + Airflow services | not started |
@@ -888,6 +893,105 @@ the bug; it surfaced only through the schema assertion.
 302 KB. Rejection rate **1.10%**, against P2's 0.9% and P3's 1.04% on the same data — three
 independent measurements converging on the same refund/void rate.
 
+### Step 2 — bulk_load + a real Spark cluster  · verified 2026-08-30
+
+`batch_jobs/jobs/bulk_load.py` plus `spark-master` / `spark-worker` in Compose. Verified on
+three deliberately non-consecutive months — 2023-01 (local mode), 2024-06 and 2025-12 (on the
+cluster) — rather than three adjacent ones, so the run exercised the adapter's case-insensitive
+column resolution (TLC renamed `airport_fee` to `Airport_fee` partway through the dataset) and
+the cutoff boundary month instead of three near-identical files.
+
+| month | read | accepted | written | rejected |
+|-------|------|----------|---------|----------|
+| 2023-01 | 3,066,766 | 3,040,385 | 3,040,385 | 0.86% |
+| 2024-06 | 3,539,193 | 3,476,089 | 3,476,089 | 1.78% |
+| 2025-12 | 4,305,006 | 4,198,089 | 4,198,089 | 2.48% |
+
+Design decisions made during implementation:
+
+- **No dedupe in the bulk loader**, departing from this entry's dedupe section. That reasoning
+  is about the *Kafka* path, where re-replay genuinely duplicates. A rerun of this job
+  overwrites its own partitions, so it is already idempotent — and `event_id` hashes a
+  six-field natural key that two distinct short trips can plausibly collide on, so deduping
+  here would silently delete real trips from the training corpus. Dedupe belongs in step 3.
+- **A month starting past the cutoff is refused, not silently empty.** Both writers use
+  dynamic partition overwrite, so a mistyped `--month` must be loud. Rejected letting the
+  row-level filter handle it: that yields a successful run that wrote nothing, which reads as
+  "this month has no data".
+- **The row-level cutoff filter is defensive, not load-bearing — worth knowing.** 2025-12
+  wrote `written == accepted`, zero dropped, and that is guaranteed rather than lucky: the
+  cutoff is `23:59:59` and TLC timestamps are second-resolution, so the only excluded instant
+  is sub-second past it and cannot exist in the data. The thing actually keeping the two
+  writers off each other's partitions is the whole-month guard. Kept anyway, because a
+  sub-second source would change that and the filter costs nothing.
+- **Repartition by `(year, month, day)` before writing.** Left alone, 16 shuffle partitions
+  each emit a file into each of ~31 day directories — ~500 tiny files per month, ~18k across a
+  36-month backfill. Confirmed: 2023-01 produced exactly 31 files, one per day.
+- **One extra `count()` pass before the write**, so the run reports a row count it verified
+  rather than one inferred from the adapter's pre-filter stats. ~45MB a month; the honesty is
+  cheap.
+
+### The four bugs step 2 found, and what they have in common
+
+All four were infrastructure; none were the Spark logic. `bulk_load.py` ran correctly the
+first time it was able to start, and every failure was in how it was launched or hosted. The
+common root cause is worth naming: this config was written on the Windows machine, which has
+no Docker daemon, so none of it could be executed before being pushed. The Python was locally
+testable and worked; the container config was pure assertion and did not.
+
+1. **`ModuleNotFoundError: no module named 'adapters'`.** Both `python jobs/bulk_load.py` and
+   `spark-submit` put the *script's* directory on `sys.path`, not the component root.
+   `pyproject`'s `pythonpath = ["."]` reads like it covers this but is a **pytest** setting and
+   applies only under a test run — which is exactly why the conformance suite never caught it.
+   Fixed in the script rather than by requiring `PYTHONPATH` in the environment, so the job
+   behaves identically by hand, under spark-submit, and under whatever working directory
+   Airflow gives it in step 5.
+2. **`KerberosAuthException: failure to login` — `NullPointerException: invalid null input:
+   name`.** uid 1000 has no entry in `apache/spark`'s `/etc/passwd`, so Hadoop's
+   `UnixLoginModule` handed `UnixPrincipal` a null name and died in `SecurityManager`'s
+   constructor before Spark started. **Identity resolution, not permissions** — no `chmod`
+   would have helped. Fixed by mounting the host's passwd file read-only, keeping the uid
+   override rather than reverting to the image's `spark` user (185): everything the cluster
+   writes lands in a host bind mount, and the P4 verification reads the lake back from the dev
+   container. Confirmed — lake files are owned by `vscode`.
+3. **A healthcheck the image could not run.** It shelled out to `curl`, which `apache/spark`
+   does not ship. It could never have passed, and the worker gates on `service_healthy`, so
+   the worker would have waited forever — a symptom that reads as a registration or networking
+   bug and sends you looking in the wrong place. The second version was also wrong: the
+   master's RPC endpoint binds to the address its hostname resolves to, so `localhost:7077` is
+   refused while the container hostname answers (measured directly), *and* a raw TCP connect
+   to 7077 makes the master log a netty stack trace plus "got disassociated, removing it" on
+   every check. Now probes the web UI on 8080 with bash's `/dev/tcp`, falling back to the RPC
+   port on the container's own address.
+4. **`spark-submit --master` is silently ignored.** `build_session()` calls
+   `.master(config.SPARK_MASTER)` unconditionally, and a builder's explicit `.master()`
+   overrides whatever spark-submit was given. The first "cluster" run was really `local[*]`
+   inside the master container — visible only as `(executor driver)` in the task lines. The
+   env var is the intended mechanism and `config.py` already says so; the submit command was
+   simply wrong. **This is a live hazard for step 5:** an Airflow `SparkSubmitOperator` sets
+   `--master` from its connection, and this code would ignore that just as quietly. The DAG
+   must set `SPARK_MASTER` in the task environment. Left as-is rather than made to defer to
+   spark-submit, because detecting "am I under spark-submit" needs a fragile env-var sniff and
+   the config-driven route is already the recorded design.
+
+### Data findings worth carrying into P5
+
+- **Rejection rate is not stable across months:** 0.86% / 1.78% / 2.48%. Earlier figures
+  (P2's 0.9%, P3's 1.04%, the fixture's 1.10%) were all *samples* of 2023-01; 0.86% is the
+  first full-population measurement of that month and supersedes them rather than
+  contradicting them.
+- **2024-06's higher rate is genuine data, not the casing path.** The structural rejection
+  categories barely moved between the two months — `dropoff_not_after_pickup` 1121 to 1140,
+  `outside_source_month` 48 to 50 — while the entire increase was `negative_money`
+  (25,212 to 61,914). Structural checks flat and the data-dependent check moving is what rules
+  out an adapter fault.
+- **December 2025 carries 58,019 zero-duration trips** (`dropoff == pickup`), against ~1,130 in
+  the other months, and only 2 genuinely negative. A meter/logging artifact, refused
+  identically by the gateway's `TripEvent` validator, so hot and cold do not diverge.
+  Consequence for P5: the last month before the cutoff runs ~1.3% thinner than its neighbours.
+- **Row counts are larger than planned on:** ~3.5–4.3M per month, not ~3M. A 36-month backfill
+  is therefore nearer 130M rows than 110M.
+
 ### Open
 
 - **Resolved 2026-08-30:** step 1 is fully green, 7/7. The concern behind this item — that
@@ -905,6 +1009,18 @@ independent measurements converging on the same refund/void rate.
 - The 302 KB fixture is committed as a knowing exception to the no-data rule. If it becomes a
   nuisance, the cheaper route is fewer accepted pairs, not regenerating it on demand — a
   skippable drift guard guards nothing.
+
+- **`bulk_load.py` has no test.** The conformance suite covers the adapter thoroughly and the
+  entrypoint not at all, which is precisely why bug 1 reached the codespace. Not obviously
+  worth a Spark-session test at this size, but the gap is real and should be a conscious
+  choice rather than an oversight.
+- **The full backfill is a scope lever.** At ~4M rows/month, 36 months is ~130M rows and ~2GB
+  of Parquet. Backfilling 12 months instead would cut step 6's runtime and disk while leaving
+  a corpus far larger than scikit-learn will use, and nothing architectural changes — the DAG
+  maps over a list either way. Undecided; re-triggerable later.
+- **Step 5 is the remaining risk concentration.** Three new containers, an Airflow metadata DB
+  and a spark-submit client image — the same blind-config surface that produced all four bugs
+  above, roughly tripled. Check the base image's toolset *before* writing healthchecks.
 
 ---
 
