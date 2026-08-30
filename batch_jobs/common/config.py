@@ -45,3 +45,17 @@ SPARK_DRIVER_HOST = os.environ.get("SPARK_DRIVER_HOST")
 # --------------------------------------------------------------------------
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "tlc-raw-events")
+
+# Which source's `source_extras` shape the lake writers use, resolved through
+# adapters/registry.py. Same principle as KAFKA_TOPIC above: the name is
+# source-specific *configuration*, so the job that reads it stays source-
+# agnostic. Both writers must agree on this value or they produce Parquet files
+# with different physical schemas in the same directory tree.
+SOURCE_EXTRAS = os.environ.get("SOURCE_EXTRAS", "tlc_yellow")
+
+# Maven coordinates for the Kafka source. Not bundled in the apache/spark image,
+# so it is resolved at submit time and pinned to the cluster's Spark version —
+# a connector built for a different Spark fails at class load, not at startup.
+KAFKA_SQL_PACKAGE = os.environ.get(
+    "KAFKA_SQL_PACKAGE", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
+)

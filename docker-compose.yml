@@ -17,6 +17,9 @@
 # .master() overrides whatever spark-submit was given, so the flag is silently
 # ignored and the job runs local[*] inside this container.
 #   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/bulk_load.py --month 2023-01
+# Recompute the post-cutoff half of the lake from the bus (no arguments — it
+# reads the whole topic and owns everything past the cutoff):
+#   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/stream_to_lake.py
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
