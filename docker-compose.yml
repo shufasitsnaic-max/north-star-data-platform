@@ -202,6 +202,9 @@ services:
       # The job source, mounted read-only so spark-submit can reach it without
       # an orchestration image — that image is step 5's problem, not step 2's.
       - ./batch_jobs:/opt/batch_jobs:ro
+      # Settings that must exist before a JVM starts, so they cannot come from
+      # common/spark.py. Currently just the Ivy cache location.
+      - ./batch_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
       # Makes uid 1000 a *resolvable* user inside the container, not just a
       # number. Hadoop's UnixLoginModule builds a UnixPrincipal from the passwd
       # entry, and with no entry it hands the constructor a null name and dies
@@ -256,6 +259,9 @@ services:
       - ./data/lake:/data/lake
       - ./data/raw:/data/raw:ro
       - ./batch_jobs:/opt/batch_jobs:ro
+      # Settings that must exist before a JVM starts, so they cannot come from
+      # common/spark.py. Currently just the Ivy cache location.
+      - ./batch_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
       # Same reason as the master: uid 1000 must resolve to a name or Hadoop's
       # login fails before the worker starts.
       - /etc/passwd:/etc/passwd:ro
