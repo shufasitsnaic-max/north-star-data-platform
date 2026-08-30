@@ -571,13 +571,13 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
 
-**Status: IN PROGRESS — steps 1-3 of 6 verified, steps 4-6 are still design.** The plan below
+**Status: IN PROGRESS — steps 1-4 of 6 verified, steps 5-6 remain.** The plan below
 was recorded *before* writing any code so it would survive a lost session; steps 4-6 remain
 intent rather than a description of the repo. What exists today is recorded under "Step 1",
 "Step 2" and "Step 3" near the end of this entry.
 
-**Next action:** step 4, `aggregate_daily.py` plus the Postgres staging/merge. Before writing
-step 5's DAG, read the bug sections under Steps 2 and 3: the DAG must set `SPARK_MASTER` in
+**Next action:** step 5, the Airflow image, services and both DAGs. Read the bug sections
+under Steps 2 and 3 first: the DAG must set `SPARK_MASTER` in
 the task environment *and* pass `--packages` on the submit line, and confusing the two gives a
 silent no-op in one direction and a hard failure in the other.
 
@@ -586,7 +586,7 @@ silent no-op in one direction and a hard failure in the other.
 | 1 | canonical Spark schema + batch adapter + conformance test | **verified** 2026-08-30, `fba0137` |
 | 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | **verified** 2026-08-30 |
 | 3 | `stream_to_lake.py` (Kafka -> lake) | **verified** 2026-08-30 |
-| 4 | `aggregate_daily.py` + staging/merge into Postgres | not started |
+| 4 | `aggregate_daily.py` + staging/merge into Postgres | **verified** 2026-08-30 |
 | 5 | `orchestration/` image + both DAGs + Airflow services | not started |
 | 6 | full 36-month backfill + verification run | not started |
 
@@ -1075,6 +1075,106 @@ anything needed before the JVM starts, and the submit line owns per-job connecto
   (stream_to_lake) coexist under `data/lake/trips/` with neither clobbering the other —
   the cutoff split working as designed.
 - Conformance suite still green after the `common/spark.py` and `common/config.py` edits.
+
+### Step 4 — aggregate_daily + the serving-table merge  · verified 2026-08-30
+
+`batch_jobs/jobs/aggregate_daily.py`, `sql/schema.sql` and `sql/merge_daily.sql`. Spark
+rolls the whole lake up to daily x zone metrics and writes a staging table; the merge
+publishes it into `cold_daily_zone_metrics` with `INSERT ... ON CONFLICT DO UPDATE`.
+
+Design decisions made during implementation:
+
+- **The merge is SQL, not Python, and that is forced as well as chosen.** `spark-submit`
+  runs jobs with the *container's* Python, not this component's uv environment, so
+  `pyspark` is the only library available inside the Spark containers. There is no
+  database driver there and no way to add one without a custom image. So the merge is a
+  `.sql` file executed by whoever has a client — `psql` during verification, Airflow's
+  Postgres operator in step 5. Worth recording as a general constraint: **nothing in
+  `batch_jobs/pyproject.toml` reaches the cluster.** It governs what any future cold-path
+  job may import.
+- **Citywide rows are aggregated from the trips, not from the per-zone averages.**
+  Averaging averages would weight a 3-trip zone the same as a 30,000-trip one. Implemented
+  as two aggregations unioned rather than a rollup or grouping set, because the union makes
+  it obvious which rows are which grain.
+- **The serving table deliberately mirrors `trip_window_metrics`** — same
+  NULL-means-citywide convention, same money-as-numeric rule, same `COALESCE(zone_id, -1)`
+  unique index. PostgreSQL treats NULLs as distinct in a unique constraint, so without that
+  trick the citywide row would be re-inserted on every merge, forever. The dashboard reads
+  both tables and should not have to learn two vocabularies for one idea.
+- **The merge skips rows whose values did not change** (`IS DISTINCT FROM` on every
+  metric). Saves dead tuples, and keeps `updated_at` meaning "this number last changed"
+  rather than "a job last ran" — which made it the tool that answered a question during
+  verification.
+- **Both connector coordinates moved into `spark-defaults.conf`.** Forgetting `--packages`
+  already caused one failure in step 3, and step 5's DAG would have to remember it per
+  task. Declared cluster-wide, no operator can omit them. `bulk_load` pays a cached Ivy
+  lookup it does not need — a fair price for deleting a class of mistake. Note this makes
+  `spark-defaults.conf` authoritative for *launcher-time* settings, `common/spark.py` for
+  session-time ones, and the submit line for nothing at all.
+
+### Verification run
+
+- **Idempotency:** first merge `INSERT 0 21644`, second merge `INSERT 0 0`. The serving
+  table is never accumulated into, and a rerun is free.
+- **Shape:** 21,644 rows over 93 days, 93 of them citywide — exactly the 31 + 30 + 31 + 1
+  days the lake held.
+- **Cross-layer reconciliation**, the check this phase's plan called "the one that actually
+  proves something". Two independent code paths over the same events:
+
+| date | replays | cold | hot | gap |
+|------|---------|------|-----|-----|
+| 2026-01-01 | 2 | 19,625 | 21,673 | **-2,048** |
+| 2026-01-02 | 1 | 19,561 | 19,561 | **0** |
+
+  On a single clean replay the two layers agree **exactly** — not within a tolerance. On
+  the day that was replayed twice they diverge, and the divergence is the hot path
+  **over-counting**: it has no dedupe, so it counted the first replay in full plus the part
+  of the second that arrived before its watermark had moved past those event times, and
+  dropped the rest as late. The cold path deduped on the natural key and holds the true
+  figure.
+
+  That is the lambda architecture's thesis demonstrated rather than claimed: the batch
+  layer is the number to trust when the two disagree. It is a *better* presentation result
+  than two matching numbers would have been.
+
+- **The prediction recorded in the plan was wrong in an instructive way.** It expected a
+  small positive gap from the hot path's late-event drops. On a replay driven at `SLEEP=0`
+  in strict `pickup_datetime` order, events arrive in event-time order, so the watermark
+  never has anything to drop — hence a gap of exactly zero. Late drops need *out-of-order*
+  arrival, which this replay does not produce. The mechanism is real; the conditions to
+  observe it are not present.
+
+- **Backfilled dates cannot be reconciled and should never be compared.** 2023-01-01 shows
+  a gap of +69,819 purely because the cold path read the whole month's file while the hot
+  path only ever saw the few thousand events P2/P3 replayed. Different event sets, not a
+  discrepancy. Reconciliation is meaningful **only on the post-cutoff half**, where both
+  layers genuinely processed the same events.
+
+### The instability the merge's own bookkeeping exposed
+
+A merge reported `INSERT 0 320` while the table grew by only 229 rows, so 91 pre-existing
+rows had been rewritten. Grouping by `updated_at` showed the second write batch spanning
+2026-01-01 to 2026-01-02 — meaning 91 rows of **2026-01-01 recomputed differently**, on a
+day whose trips had not changed at all.
+
+Re-running the aggregation over an unchanged lake produced `INSERT 0 0`, so the job is
+**reproducible**. The churn appeared only when the input *grew*. Best explanation, strongly
+suspected but not provable now that the old values are overwritten: `avg_distance_km` is
+the only metric stored at full precision, floating-point addition is not associative, and
+adding a day changed how rows distribute across shuffle partitions and therefore the order
+the distances were summed. Counts and `Decimal` sums are exact, and the fare averages are
+narrowed to 2 decimals, which rounds any equivalent noise away.
+
+Fixed by rounding `avg_distance_km` to 3 decimals — metre precision on a kilometre figure,
+far beyond what a source reporting miles to 2 decimals justifies. The property being
+defended is worth stating: **a day's numbers must not depend on which other days exist in
+the lake.** Without it every scheduled run would rewrite rows that had not changed, and
+`updated_at` would degrade from "this number last changed" into "a job last ran".
+
+Worth noting *how* this was caught: only because the merge skips unchanged rows. A plain
+`DO UPDATE` would have rewritten all 21,644 rows every run and hidden the instability
+completely. The optimisation paid for itself as instrumentation before it ever paid for
+itself as performance.
 
 ### Open
 

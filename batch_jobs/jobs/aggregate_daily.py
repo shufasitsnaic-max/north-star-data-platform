@@ -61,7 +61,20 @@ def _metrics(trips: DataFrame, group_by: list) -> DataFrame:
         # avg() ignores nulls, so this averages over the trips that actually
         # carried a distance. A day where none did yields NULL, which is
         # different from an average of zero and is stored as such.
-        F.avg("trip_distance_km").alias("avg_distance_km"),
+        #
+        # Rounded because this is the only metric kept at full precision, and
+        # floating-point addition is not associative: the result depends on the
+        # order Spark sums the values, which depends on how rows land across
+        # shuffle partitions, which changes as the lake grows. Observed as 91
+        # rows of 2026-01-01 being rewritten by a merge after 2026-01-02 was
+        # added — same trips, same count, different last bits. A day's numbers
+        # must not depend on which other days exist.
+        #
+        # 3 decimals is metre precision on a kilometre figure, well beyond what
+        # a source reporting miles to 2 decimals can justify. The other metrics
+        # need no equivalent: counts and Decimal sums are exact, and the fare
+        # averages are already narrowed to 2 decimals on the way out.
+        F.round(F.avg("trip_distance_km"), 3).alias("avg_distance_km"),
     )
 
 
