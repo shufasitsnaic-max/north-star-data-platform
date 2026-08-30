@@ -53,6 +53,7 @@ import pandas as pd
 FEATURE_COLUMNS = [
     "pickup_zone_id",
     "dropoff_zone_id",
+    "zone_pair",
     "hour",
     "day_of_week",
     "month",
@@ -60,7 +61,23 @@ FEATURE_COLUMNS = [
 ]
 
 # Encoded against the target; see the module docstring.
-ZONE_COLUMNS = ["pickup_zone_id", "dropoff_zone_id"]
+#
+# `zone_pair` is here because the first model without it LOST to a zone-pair
+# median lookup by 43% on MAE. Encoding the two zones independently destroys the
+# thing that sets the price: "Midtown" averages ~$18 and "JFK" averages ~$60,
+# but neither number says that *this pair* is a long airport run. The lookup
+# keeps that interaction; six loosely-related numerics cannot reconstruct 69k
+# pair-specific prices from two marginals.
+#
+# With the pair encoded, the model starts from the same information the lookup
+# has and adds what the lookup cannot express — how the hour, the weekday and
+# the season move that pair's price.
+ZONE_COLUMNS = ["pickup_zone_id", "dropoff_zone_id", "zone_pair"]
+
+# Sentinel for a pair where either zone is missing. TargetEncoder treats it as
+# one more category and learns its mean, which is more honest than dropping the
+# row or inventing a zone.
+_MISSING_ZONE = -1
 
 # Passed to the booster as plain numbers. All are low-cardinality and either
 # ordered or close enough that tree splits capture them: the model can isolate
@@ -96,10 +113,16 @@ def build_features(frame: pd.DataFrame, pickup_column: str = "pickup_datetime") 
     """
     pickup = pd.to_datetime(frame[pickup_column])
 
+    pickup_zone = frame["pickup_zone_id"].fillna(_MISSING_ZONE).astype("int64")
+    dropoff_zone = frame["dropoff_zone_id"].fillna(_MISSING_ZONE).astype("int64")
+
     features = pd.DataFrame(
         {
-            "pickup_zone_id": frame["pickup_zone_id"],
-            "dropoff_zone_id": frame["dropoff_zone_id"],
+            "pickup_zone_id": pickup_zone,
+            "dropoff_zone_id": dropoff_zone,
+            # One id per origin/destination pair. 265 zones fit in three digits,
+            # so this is lossless and reverses as (pair // 1000, pair % 1000).
+            "zone_pair": pickup_zone * 1000 + dropoff_zone,
             "hour": pickup.dt.hour,
             "day_of_week": pickup.dt.dayofweek,
             "month": pickup.dt.month,

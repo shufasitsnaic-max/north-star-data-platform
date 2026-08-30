@@ -59,11 +59,12 @@ from features import (
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("ml.train")
 
-# Bumped whenever the feature contract or the estimator changes. Written into
+# Bumped whenever the feature contract or the estimator changes. v2 added the
+# encoded zone pair after v1 lost to the zone-pair median lookup by 43%. Written into
 # every prediction row so the daily evaluation can tell one model's errors from
 # another's — without it, swapping models silently mixes two error series into
 # one meaningless average.
-MODEL_VERSION = "fare-hgb-1"
+MODEL_VERSION = "fare-hgb-2"
 
 _COLUMNS = [
     "pickup_datetime",

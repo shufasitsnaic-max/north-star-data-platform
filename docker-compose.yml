@@ -466,6 +466,10 @@ services:
       MODEL_DIR: /models
       CUTOFF_DATETIME: ${CUTOFF_DATETIME:-2025-12-31T23:59:59}
       TRAIN_SAMPLE_ROWS: ${TRAIN_SAMPLE_ROWS:-1500000}
+    # Same uid as the Spark and Airflow services: the artifact lands in a host
+    # bind mount, and a root-owned model cannot be deleted from the dev
+    # container without sudo.
+    user: "1000:1000"
     volumes:
       # The lake read-only: training reads history and must never alter it.
       - ./data/lake:/data/lake:ro
