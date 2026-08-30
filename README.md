@@ -61,7 +61,7 @@ Each phase must pass its verification routine before the next begins.
 - [x] **Phase 3** — Hot path: Kafka consumer -> rolling metrics -> PostgreSQL
 - [x] **Phase 4** — Cold path: Airflow + Spark -> partitioned Parquet, daily aggregates -> PostgreSQL
 - [x] **Phase 5** — ML: fare estimation at pickup, scored live, evaluated daily by Airflow
-- [ ] **Phase 6** — Streamlit dashboard (hot + cold + preds + alerts)
+- [x] **Phase 6** — Streamlit dashboard: live hot metrics, cold trends, per-trip quotes, alerts
 
 ## Getting started
 
@@ -138,8 +138,15 @@ cd gateway && uv sync && uv run uvicorn main:app
 
 ## Status
 
-Phases 1–5 complete and verified end-to-end: validation gateway, Kafka + producer +
-replay simulator, hot path -> PostgreSQL, the full cold path, and the ML layer.
+**All six phases built.** Validation gateway, Kafka + producer + replay simulator, hot
+path -> PostgreSQL, the full cold path, the ML layer, and a Streamlit dashboard over
+all of it. Phases 1–5 are verified end-to-end; the dashboard renders against live data
+with a browser pass on its newest panels outstanding.
+
+The dashboard is **read-only** — it owns no tables and writes nothing, reading three
+tables written by three components that do not know it exists. It filters the view and
+hands you the replay command rather than starting a replay itself, which keeps that
+property intact.
 
 **Phase 5 (ML) estimates what a ride will cost, before it starts** — the upfront-pricing
 question a rider actually asks. It uses only what is known at pickup: the two zones and

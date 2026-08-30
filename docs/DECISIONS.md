@@ -1277,10 +1277,12 @@ decision taken today; the remaining months need only an extended list and a re-t
   entrypoint not at all, which is precisely why bug 1 reached the codespace. Not obviously
   worth a Spark-session test at this size, but the gap is real and should be a conscious
   choice rather than an oversight.
-- **The full backfill is a scope lever.** At ~4M rows/month, 36 months is ~130M rows and ~2GB
-  of Parquet. Backfilling 12 months instead would cut step 6's runtime and disk while leaving
-  a corpus far larger than scikit-learn will use, and nothing architectural changes — the DAG
-  maps over a list either way. Undecided; re-triggerable later.
+- **The full backfill is a scope lever — RESOLVED 2026-08-30, see "Operational findings".**
+  Settled at 12 months, then reversed to the full 36 once 8.49GB of Spark worker scratch was
+  reclaimed. Original text: at ~4M rows/month, 36 months is ~130M rows and ~2GB of Parquet.
+  Backfilling 12 months instead would cut step 6's runtime and disk while leaving a corpus far
+  larger than scikit-learn will use, and nothing architectural changes — the DAG maps over a
+  list either way.
 - **Step 5 is the remaining risk concentration.** Three new containers, an Airflow metadata DB
   and a spark-submit client image — the same blind-config surface that produced all four bugs
   above, roughly tripled. Check the base image's toolset *before* writing healthchecks.
@@ -1498,6 +1500,141 @@ identical trips, so they do not move an average — but the count is not a trip 
 - **Four days of forward data.** Enough to separate the holiday from normal days, not enough
   to characterise weekly or seasonal behaviour. The replay is capped by `MAX_ROWS`, not by
   anything structural.
+
+
+## Phase 6 — Streamlit dashboard  · 2026-08-30
+
+**Status: BUILT, partially verified.** The base page renders against live data. The live
+scoring feed, the event-time range filter and the replay-command panel were added after that
+first render and have not been checked in a browser yet.
+
+### What it is, and what it deliberately is not
+
+A **read-only view** over the serving store. It owns no tables, writes nothing, and reads
+three tables written by three components that do not know it exists — `trip_window_metrics`
+from the hot path, `cold_daily_zone_metrics` from the cold path, and `fare_predictions` /
+`ml_daily_eval` from the ML layer. That is why it can be restarted mid-demo without
+consequence, and why a bug in it cannot corrupt anything.
+
+**The request that was turned down, and why.** The original ask was a date picker that
+*starts* a simulation from the chosen date. Doing that means launching a container from a web
+page, which means mounting the Docker socket into it — trading a real architectural property
+for a button. Instead the sidebar renders the exact `docker compose run` command for the
+chosen date and event count, so the demo is still driven from one screen and the read-only
+property survives. If a real button is wanted later, the clean route is an Airflow DAG
+triggered through its API: orchestration is the component whose job is starting jobs.
+
+### A conceptual correction worth keeping
+
+The proposed feed had quoted and charged appearing separately — the quote first, the true
+fare "arriving a few minutes later" and updating the row. That is how it works in production
+and **not** how it works here: a replayed event describes a trip that already finished, so it
+carries its own fare, and the predictor writes both columns milliseconds apart. There is no
+later moment when truth shows up.
+
+What is real, and what the dashboard shows instead, is the **cold path correcting the hot
+path**. The hot path publishes a count within seconds from in-memory windows that drop late
+events and do not deduplicate; the cold path republishes the same day minutes later,
+recomputed from the whole log. That is a genuine value that changes, from a genuine second
+pass, and it is the lambda architecture's actual claim rather than a simulation of it.
+
+### Chart decisions
+
+- **No dual-axis charts, anywhere.** Trip counts and dollars are different scales, so they
+  get separate charts. Two y-axes on one plot let an author imply any correlation they like
+  by choosing the scales; it is the most common way a chart lies.
+- **The categorical palette was validated, not chosen by eye.** Blue `#2a78d6` and orange
+  `#eb6834` clear the lightness band, the chroma floor, colour-vision-deficiency separation
+  (worst all-pairs dE 24.7 against an 8 target), the normal-vision floor and 3:1 contrast
+  against the `#fcfcfb` surface the theme pins. The theme is pinned to light deliberately:
+  those contrast figures are only meaningful against the surface the chart actually renders
+  on, so a dark mode needs its own validated steps rather than an automatic inversion.
+- **Colour follows the entity, never its rank.** Charged is always blue, quoted always
+  orange, with fixed scale domains so filtering a series cannot repaint the survivor.
+- **Two series always carry a legend**, and the error band in the feed is a coloured
+  *number* with a spelled-out caption — never a bare coloured dot. Colour reinforces the
+  value; it never carries the meaning alone.
+
+### Alerts read other components' numbers
+
+The dashboard invents no analysis. Each rule reads a figure some other component computed, so
+any alert's evidence is a row someone else wrote:
+
+- **Model error** compares each day's MAE against the *median of the other days* rather than
+  a fixed threshold. It asks "is this day unlike the others", which keeps working across
+  retrains and price shifts; a fixed threshold would need re-tuning after both.
+- **Explanatory power** is a separate rule from error, because they say different things. A
+  high MAE on a day of expensive trips can still be a working model; an R2 near zero means
+  the model is not tracking *which* trips are expensive, which is a failure of the model
+  rather than a hard day. New Year's Day trips this one and not the other way round.
+- **Layer divergence** flags hot-vs-cold gaps over 5%, and says in the alert text that the
+  cold path is the number to trust.
+- **Scoring idle** is the only wall-clock rule, deliberately: it asks whether the *service*
+  is alive, which is a question about now, not about when the trips happened.
+
+Every alert ships with an icon, a title and a sentence of why. A red dot alone tells a
+colourblind reader nothing and everyone else nothing actionable.
+
+### Open
+
+- **Not yet eyeballed.** The palette validator checks colour, not layout. Label collisions,
+  overflow and column widths need a browser pass.
+- **`dropoff_datetime` is NULL on rows scored before it existed.** The column was added to a
+  running system, and ~205k rows predate it. Re-scoring after a consumer-group reset would
+  fill them; leaving it means the feed shows blank durations for early trips.
+- **No dark mode.** Deliberate rather than missing — see the palette note above.
+
+---
+
+## Operational findings — 2026-08-30
+
+Two things found while preparing to extend the backfill, neither of which any test would have
+caught, and both worth keeping because they are about *running* the system rather than
+building it.
+
+### Spark's worker was quietly eating the data lake's disk
+
+`/workspaces` and `/var/lib/docker` are **the same 32GB filesystem** on this machine. So
+Docker's footprint competes directly with the Parquet lake, which is a bind mount into the
+repository.
+
+`docker ps -s` showed **spark-worker holding an 8.49GB writable layer**, against tens of
+megabytes for every other container. The cause: `SPARK_WORKER_DIR=/tmp/spark-work` holds every
+executor's scratch, stdout and stderr, and **Spark's worker never cleans it up by default**.
+Roughly 40 spark-submits had accumulated that.
+
+Recreating the container reclaimed all of it — 4.0GB free became 12GB — and
+`SPARK_WORKER_OPTS` now enables cleanup (every 15 minutes, keeping 30 minutes of history so a
+recent failure can still be inspected).
+
+**Why it matters beyond the fix:** nothing reported this. It surfaced only because we asked
+whether there was room for more months. Left alone it would have failed mid-backfill as a
+confusing write error rather than an obvious "out of space", with a half-loaded lake.
+
+### The backfill scope decision, reversed on evidence
+
+Recorded earlier the same day as **12 months**, chosen because 36 looked like it would not
+fit. After reclaiming the 8.49GB, 36 months fits with ~4.5GB to spare, so the range is now
+**2023-01 .. 2025-12** — three continuous years rather than three disconnected islands, which
+is what the dashboard's trend chart actually wants.
+
+The range moved from a hardcoded list into `BACKFILL_START` / `BACKFILL_END` configuration at
+the same time, because the binding constraint is disk and scope should be trimmable without
+editing a DAG. Measured consumption is **~330MB of lake per month**, not the ~200MB estimated.
+
+### `aggregate_daily` no longer re-reads the whole lake
+
+It recomputed every day in the lake on every 3-minute run. At 45M rows that took ~2 minutes;
+at 110M it would have exceeded its own schedule and the DAG would never have kept up.
+
+The waste is structural rather than incidental: **backfilled history never changes**, so
+re-aggregating 2023 every three minutes reproduces numbers already in the serving table. So
+`--since` now defaults to the cutoff — the only range the Kafka writer moves — and
+`cold_path_backfill` runs one full pass (`--since 1970-01-01`) plus the merge after its months
+land, so loading months and publishing their metrics happen together.
+
+Rejected simply lengthening the schedule: it trades a slower dashboard for a problem that
+returns the next time the backfill grows.
 
 ---
 

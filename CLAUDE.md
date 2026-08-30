@@ -82,8 +82,10 @@ scaffold future phases early.
   events off the bus, and an Airflow DAG records daily predicted-vs-actual error. Verified:
   normal-day MAE $4.36-$4.94 against $3.91 in training, and a New Year's Day R2 of 0.025 the
   evaluation caught on its own.
-- **P6 — Dashboard:** Streamlit shows live hot metrics, cold historical trends,
-  predicted-vs-actual, and anomaly alerts — refreshing as the simulator replays.
+- **P6 — Dashboard** (built, browser pass outstanding): Streamlit shows live hot metrics,
+  cold historical trends, a per-trip quoted-vs-charged feed, and anomaly alerts — refreshing
+  as the simulator replays. Read-only by design: it owns no tables and writes nothing, which
+  is why it filters the view and hands you the replay command rather than starting one.
 
 ## How we work together
 
