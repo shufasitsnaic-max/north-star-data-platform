@@ -16,6 +16,19 @@ to be stored as typed columns — arrives as a *name* from configuration and is
 resolved through `adapters/registry.py`. Configuration may know the source;
 code may not.
 
+Running it
+----------
+The Kafka source is not bundled in the apache/spark image and is a launcher-time
+dependency, so every invocation must supply it:
+
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 jobs/stream_to_lake.py
+
+The coordinate lives in config.KAFKA_SQL_PACKAGE so the DAG and this docstring
+cannot drift apart. It cannot be enforced from inside the job — by the time
+Python runs, the JVM classpath is already fixed — so a missing connector is
+turned into an error message naming this command rather than Spark's bare
+"Failed to find data source: kafka".
+
 Full recompute, every run
 -------------------------
 `startingOffsets: earliest` -> `endingOffsets: latest` on every invocation, with
@@ -70,6 +83,12 @@ _MISSING_TOPIC_MARKERS = (
     "do not exist",
     "does not exist",
 )
+
+# The connector is not bundled in the apache/spark image and cannot be added
+# from inside a running JVM — see the note in common/spark.py. When it is
+# absent Spark says only "Failed to find data source: kafka", which does not
+# hint at the cause, so it is translated into the command that fixes it.
+_MISSING_CONNECTOR_MARKER = "failed to find data source: kafka"
 
 
 def _read_topic(spark) -> DataFrame:
@@ -162,13 +181,22 @@ def _deduplicate(events: DataFrame) -> tuple[DataFrame, int, int]:
 
 def stream_to_lake() -> int:
     """Rebuild the post-cutoff partitions from the topic. Returns rows written."""
-    spark = build_session("stream_to_lake", packages=[config.KAFKA_SQL_PACKAGE])
+    spark = build_session("stream_to_lake")
 
     try:
         raw = _read_topic(spark)
         events = _parse(raw, config.SOURCE_EXTRAS)
     except Exception as exc:  # noqa: BLE001 — narrowed immediately below
         message = str(exc).lower()
+        if _MISSING_CONNECTOR_MARKER in message:
+            spark.stop()
+            raise RuntimeError(
+                "the Kafka source is not on the classpath. It is a launcher-time "
+                "dependency and cannot be added from inside a running JVM, so it must "
+                f"be passed at submit time:\n"
+                f"    spark-submit --packages {config.KAFKA_SQL_PACKAGE} "
+                f"{Path(__file__).name}"
+            ) from exc
         if any(marker in message for marker in _MISSING_TOPIC_MARKERS):
             logger.info(
                 "topic %s does not exist yet — nothing to recompute. Run the simulator "

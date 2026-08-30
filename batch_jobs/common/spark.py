@@ -19,24 +19,20 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s
 logger = logging.getLogger("batch_jobs.spark")
 
 
-def build_session(
-    app_name: str,
-    max_attempts: int = 6,
-    packages: list[str] | None = None,
-) -> SparkSession:
+def build_session(app_name: str, max_attempts: int = 6) -> SparkSession:
     """Build a SparkSession, retrying with backoff until the master answers.
 
     Inter-service connections retry before failing structurally (CLAUDE.md), and
     a Spark master that is still electing itself when Airflow fires the first
     task is the normal case on a cold `docker compose up`, not an error.
 
-    `packages` are Maven coordinates for connectors the image does not bundle
-    (currently only the Kafka source). Set here rather than passed as
-    `spark-submit --packages` for the same reason the master URL is read from
-    config: this builder's explicit settings override whatever the submit line
-    supplied, so a flag would be silently ignored — which already cost a
-    verification round when `--master` turned out to be a no-op. A job that
-    needs a connector declares it in code, and no DAG can forget it.
+    Note what this function deliberately does NOT do: supply connector JARs.
+    `spark.jars.packages` is a *launcher* setting — SparkSubmit resolves it
+    through Ivy and builds the classpath before the JVM exists — so setting it
+    on a builder inside an already-running JVM is too late and silently has no
+    effect. `spark.master` is read at session creation and so can live in
+    config; the two look alike and are not. Connectors must be passed as
+    `spark-submit --packages`; see jobs/stream_to_lake.py.
     """
     delay = 2.0
     last_error: Exception | None = None
@@ -64,12 +60,6 @@ def build_session(
                 # tiny files, which is slower to write and slower to read back.
                 .config("spark.sql.shuffle.partitions", "16")
             )
-
-            if packages:
-                # Ivy resolves these on first use and caches under HOME, which
-                # the Spark containers point at /tmp — uid 1000 owns nothing
-                # else in those images.
-                builder = builder.config("spark.jars.packages", ",".join(packages))
 
             if config.SPARK_DRIVER_HOST:
                 # Executors dial the driver back on this address. Without it,
