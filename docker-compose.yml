@@ -18,10 +18,13 @@
 # ignored and the job runs local[*] inside this container.
 #   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/bulk_load.py --month 2023-01
 # Recompute the post-cutoff half of the lake from the bus (no arguments — it
-# reads the whole topic and owns everything past the cutoff). The --packages flag
-# is required: the Kafka source is not in the image, and it is a launcher-time
-# dependency the job cannot add for itself.
-#   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 /opt/batch_jobs/jobs/stream_to_lake.py
+# reads the whole topic and owns everything past the cutoff):
+#   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/stream_to_lake.py
+#
+# Roll the lake up to daily x zone metrics, then publish them:
+#   docker compose exec -e SPARK_MASTER=spark://spark-master:7077 spark-master /opt/spark/bin/spark-submit /opt/batch_jobs/jobs/aggregate_daily.py
+#   docker compose exec -T postgres psql -U northstar -d northstar -f - < batch_jobs/sql/schema.sql
+#   docker compose exec -T postgres psql -U northstar -d northstar -f - < batch_jobs/sql/merge_daily.sql
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
@@ -188,6 +191,14 @@ services:
       # The image has no home directory for uid 1000, and the JVM will try to
       # use one. Point it somewhere writable rather than let it guess.
       HOME: /tmp
+      # Serving-store credentials for aggregate_daily's JDBC write. Only the
+      # driver needs them: it reads them via common/config.py and passes them
+      # as writer options, which travel with the job — executors never read
+      # this environment, which is also why spark-worker does not carry them.
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
     # Run as the dev container's user (uid 1000), not the image's `spark` user
     # (uid 185). Everything this cluster writes lands in a host bind mount, and
     # files owned by 185 would be unreadable from the dev container terminal —

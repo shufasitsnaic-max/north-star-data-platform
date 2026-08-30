@@ -56,6 +56,34 @@ SOURCE_EXTRAS = os.environ.get("SOURCE_EXTRAS", "tlc_yellow")
 # Maven coordinates for the Kafka source. Not bundled in the apache/spark image,
 # so it is resolved at submit time and pinned to the cluster's Spark version —
 # a connector built for a different Spark fails at class load, not at startup.
+#
+# Recorded here for documentation and for step 5's DAG, but NOT applied from
+# this process: connector JARs are a launcher-time concern resolved before the
+# JVM exists (see common/spark.py). Both coordinates are declared in
+# batch_jobs/conf/spark-defaults.conf, which is where they actually take effect.
 KAFKA_SQL_PACKAGE = os.environ.get(
     "KAFKA_SQL_PACKAGE", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
 )
+POSTGRES_JDBC_PACKAGE = os.environ.get("POSTGRES_JDBC_PACKAGE", "org.postgresql:postgresql:42.7.4")
+
+# --------------------------------------------------------------------------
+# Serving store. The same PostgreSQL the hot path writes its window metrics to
+# — one serving database, two tables, rather than two databases the dashboard
+# would have to join across.
+# --------------------------------------------------------------------------
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.environ.get("POSTGRES_DB", "northstar")
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "northstar")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "northstar")
+
+# Spark writes here; a separate SQL step merges into the serving table. Staging
+# is disposable and carries no indexes, so overwriting it is free — which is
+# the whole point of not overwriting the table the dashboard reads.
+STAGING_TABLE = os.environ.get("STAGING_TABLE", "cold_daily_zone_metrics_staging")
+SERVING_TABLE = os.environ.get("SERVING_TABLE", "cold_daily_zone_metrics")
+
+
+def jdbc_url() -> str:
+    """JDBC URL for the serving store. Credentials are passed separately."""
+    return f"jdbc:postgresql://{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
