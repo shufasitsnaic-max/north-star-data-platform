@@ -287,6 +287,17 @@ services:
       SPARK_WORKER_DIR: /tmp/spark-work
       SPARK_LOG_DIR: /tmp/spark-logs
       HOME: /tmp
+      # Delete finished applications' work directories. Spark's worker keeps
+      # every executor's scratch and stdout/stderr forever by default, in the
+      # container's writable layer — which on this machine shares one 32GB
+      # filesystem with the data lake itself. Around 40 submits had grown the
+      # container layers to 8.7GB while the lake was competing for the same
+      # disk. Cleanup is a *daemon* setting, so it arrives through
+      # SPARK_WORKER_OPTS rather than spark-defaults.conf.
+      SPARK_WORKER_OPTS: >-
+        -Dspark.worker.cleanup.enabled=true
+        -Dspark.worker.cleanup.interval=900
+        -Dspark.worker.cleanup.appDataTtl=1800
     user: "1000:1000"
     volumes:
       # Executors write the lake's Parquet files themselves, so the worker needs
