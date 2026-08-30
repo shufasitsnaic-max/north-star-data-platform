@@ -571,13 +571,19 @@ local clone, and `has_uncommitted_changes` in the API is a real signal worth hee
 
 ## Phase 4 — Cold path: Airflow + Spark -> partitioned Parquet  · 2026-08-16
 
-**Status: IN PROGRESS — steps 1-4 of 6 verified, steps 5-6 remain.** The plan below
-was recorded *before* writing any code so it would survive a lost session; steps 4-6 remain
-intent rather than a description of the repo. What exists today is recorded under "Step 1",
-"Step 2" and "Step 3" near the end of this entry.
+**Status: VERIFIED end-to-end 2026-08-30.** All six steps built and verified in one
+session. The plan below was recorded *before* writing any code so it would survive a lost
+session; the "Step N" sections near the end of this entry describe what was actually built,
+including where it departs from the plan and why.
 
-**Next action:** step 5, the Airflow image, services and both DAGs. Read the bug sections
-under Steps 2 and 3 first: the DAG must set `SPARK_MASTER` in
+Phase 4's headline result is the cross-layer reconciliation under Step 4: on a single clean
+replay the hot and cold paths agree **exactly**, and where they diverge the cold path is
+demonstrably the correct one. That is the lambda architecture's central claim, measured
+rather than asserted.
+
+**Next action: Phase 5 (ML).** Read the bug sections under Steps 2, 3 and 5 before adding
+any new Spark task — the launcher-versus-runtime distinction below governs how anything new
+must be invoked: the DAG must set `SPARK_MASTER` in
 the task environment *and* pass `--packages` on the submit line, and confusing the two gives a
 silent no-op in one direction and a hard failure in the other.
 
@@ -587,8 +593,8 @@ silent no-op in one direction and a hard failure in the other.
 | 2 | `bulk_load.py` + `spark-master` / `spark-worker` in Compose | **verified** 2026-08-30 |
 | 3 | `stream_to_lake.py` (Kafka -> lake) | **verified** 2026-08-30 |
 | 4 | `aggregate_daily.py` + staging/merge into Postgres | **verified** 2026-08-30 |
-| 5 | `orchestration/` image + both DAGs + Airflow services | not started |
-| 6 | full 36-month backfill + verification run | not started |
+| 5 | `orchestration/` image + both DAGs + Airflow services | **verified** 2026-08-30 |
+| 6 | backfill (12 months, scoped down) + verification run | **verified** 2026-08-30 |
 
 ### Resuming (read this first)
 
@@ -1175,6 +1181,79 @@ Worth noting *how* this was caught: only because the merge skips unchanged rows.
 `DO UPDATE` would have rewritten all 21,644 rows every run and hidden the instability
 completely. The optimisation paid for itself as instrumentation before it ever paid for
 itself as performance.
+
+### Steps 5 and 6 — Airflow, and the backfill  · verified 2026-08-30
+
+`orchestration/` (image + three DAG files) and four Compose services. Both DAGs ran to
+success under the scheduler, not just under `airflow tasks test`.
+
+- **BashOperator, not SparkSubmitOperator** — a deliberate deviation from the plan. That
+  operator's main contribution is building `--master` and `--packages`, and this project
+  resolves both elsewhere: the master URL must arrive as `SPARK_MASTER` because
+  `common/spark.py`'s explicit `.master()` would override the flag, and connectors must be
+  declared before the JVM exists. The operator would have added an Airflow-connection
+  indirection plus `env_vars` semantics never verified here, in exchange for two flags this
+  code ignores. `BashOperator` runs the command already proven by hand, so its failure modes
+  were known before it ran.
+- **`SPARK_CONF_DIR=/opt/spark-conf`** on the scheduler, pointing at the same
+  `batch_jobs/conf` the Spark services mount. Without it the driver in this container gets
+  neither the Ivy cache path nor the connector packages — reproducing both step-3 bugs
+  inside a new image. It worked first try, which is the only reason step 5 was not a third
+  round of the same two failures.
+- **Client mode puts the driver in the scheduler**, so that service carries the JDK, the
+  lake read-write, the raw drop read-only, and `SPARK_DRIVER_HOST`. Confirmed from the logs:
+  tasks ran on `172.19.0.2 (executor 0)` with the UI at `airflow-scheduler:4040` — the
+  worker executing, the driver local, which is exactly the intended topology.
+- **`airflow db migrate` and `users create` run in a one-shot `airflow-init`**, like
+  `simulator`. Both idempotent, so a repeated `up` is harmless.
+- **The connection is supplied as `AIRFLOW_CONN_NORTHSTAR_PG` in the environment**, not
+  created in the UI. A connection living only in the metadata database is invisible in this
+  repository and vanishes with the volume.
+
+**The bug: `could not translate host name "postgres"`.** Both SQL tasks failed on DNS.
+`airflow-scheduler` declared `depends_on` for what it needs to *boot* — `airflow-init` and
+`spark-master` — but not for the services its *tasks* talk to. Docker DNS only resolves
+running containers, so bringing up the scheduler alone produced one whose every task failed
+on name resolution, which reads as a network fault rather than a container that was never
+started. Fixed by depending on `postgres` and `kafka` as well. Worth generalising: a
+service's dependencies are what its work touches, not just what its process needs to start.
+
+**A smaller trap, recorded because it will recur.** `devcontainer.json`'s `forwardPorts` is
+read only when the container is **created**, so adding 8080 and 8081 there does nothing for
+an already-running codespace — the ports must be added by hand in the PORTS panel until the
+next rebuild. Codespaces also does not expose ports on the laptop's `localhost` at all; the
+forwarded `*.app.github.dev` URL is the only route.
+
+### Step 6 — the backfill, and Phase 4's verification
+
+Twelve months (2025-01..2025-12) via `cold_path_backfill`'s dynamic task mapping, two
+concurrent, **17 minutes end to end**, `success`. Twelve rather than thirty-six by the scope
+decision taken today; the remaining months need only an extended list and a re-trigger.
+
+| check | result |
+|-------|--------|
+| CLAUDE.md's P4 assertion | 428 Parquet files, SNAPPY, `year=/month=/day=` |
+| serving table | 102,783 rows, 2023-01-01 .. 2026-01-02, written by Airflow |
+| `cold_path_backfill` | success, 12/12 mapped tasks |
+| `cold_path_incremental` | four consecutive scheduled runs green |
+| cross-layer reconciliation | exact agreement on a single replay (step 4) |
+
+- **The 3-minute cadence holds, with a caveat.** Each incremental run takes ~1:45-2:05
+  against a 3-minute schedule, so it keeps up — but there is a stable ~3-minute lag left over
+  from the initial queue, and `aggregate_daily` re-reads the entire lake every run. At 45M
+  rows that is fine; it is the first thing that will stop being fine if the backfill is
+  extended to 36 months. The fix then is scoping the aggregation to recent dates, not
+  lengthening the schedule.
+- **The memory estimate was badly pessimistic.** The plan projected ~10.5GB resident with the
+  full stack and moved the codespace to 4-core/16GB on that basis. Measured with all ten
+  containers up: **4.7GB** — webserver 1.59, spark-worker 1.22, scheduler 0.79, kafka 0.68,
+  and everything else under 300MB. The upgrade was probably unnecessary for memory; the extra
+  cores still earn their keep on Spark. Recorded because the estimate drove a decision that
+  doubles core-hour burn.
+- **Rejection rates keep climbing with the source's age:** 0.86% (2023-01), 1.78% (2024-06),
+  2.48% (2025-12), **4.22%** (2025-01). Not investigated per-month; 2025-12's spike was
+  traced to zero-duration trips, and the same cause is plausible here. Worth a look in P5
+  since it is the training corpus that thins.
 
 ### Open
 

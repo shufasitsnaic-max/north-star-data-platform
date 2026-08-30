@@ -75,9 +75,9 @@ scaffold future phases early.
   topic via `kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic tlc-raw-events --from-beginning`.
 - **P3 — Hot path** (done): `psql` row scans confirm rolling-window metrics update as the
   consumer processes replayed events.
-- **P4 — Cold path** (in progress, step 1 of 6 — see `docs/DECISIONS.md` for the step table
-  and a resume checklist): `pyarrow.parquet.ParquetFile('/data/lake/...').metadata` asserts
-  schema + `year=/month=/day=` partitions.
+- **P4 — Cold path** (done): `pyarrow.parquet.ParquetFile('/data/lake/...').metadata` asserts
+  schema + `year=/month=/day=` partitions. Also verified: Airflow runs both DAGs unattended,
+  and hot vs cold trip counts reconcile exactly on a single replay.
 - **P5 — ML:** train on <=cutoff; predictions written to Postgres; Airflow daily-eval DAG
   compares predicted vs actual and records error metrics.
 - **P6 — Dashboard:** Streamlit shows live hot metrics, cold historical trends,
