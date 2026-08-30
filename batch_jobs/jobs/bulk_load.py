@@ -35,13 +35,29 @@ import argparse
 import logging
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-from pyspark.sql import functions as F
+# Put the component root on sys.path before importing anything out of it.
+#
+# Both entrypoints need this and neither supplies it: `python jobs/bulk_load.py`
+# puts *jobs/* on sys.path, and spark-submit likewise uses the submitted
+# script's own directory — so `import adapters...` resolves in neither.
+# pyproject's `pythonpath = ["."]` looks like it should cover this but is a
+# pytest setting and applies only during a test run.
+#
+# Doing it here rather than demanding a PYTHONPATH in the environment keeps the
+# job runnable identically by hand, under spark-submit, and from whatever
+# working directory Airflow picks in step 5 — one less thing for a DAG to get
+# wrong. Only the driver ever needs it: the adapter is pure Spark SQL with no
+# Python UDFs, so executors run no Python at all.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adapters.tlc_batch_adapter import TLC_SOURCE_EXTRAS, adapt_tlc_batch
-from common import config
-from common.spark import build_session
-from schemas.canonical_spark import lake_columns
+from pyspark.sql import functions as F  # noqa: E402
+
+from adapters.tlc_batch_adapter import TLC_SOURCE_EXTRAS, adapt_tlc_batch  # noqa: E402
+from common import config  # noqa: E402
+from common.spark import build_session  # noqa: E402
+from schemas.canonical_spark import lake_columns  # noqa: E402
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("batch_jobs.bulk_load")
