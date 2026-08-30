@@ -389,6 +389,11 @@ services:
       # in this container. Without this Spark advertises an unreachable
       # hostname and every task hangs until it times out.
       SPARK_DRIVER_HOST: airflow-scheduler
+      # Which months cold_path_backfill loads. Configuration rather than code,
+      # because disk is the binding constraint: the lake runs ~200MB a month, so
+      # the range is trimmed to fit rather than by editing a DAG.
+      BACKFILL_START: ${BACKFILL_START:-2023-01}
+      BACKFILL_END: ${BACKFILL_END:-2025-12}
       # --- serving store, for aggregate_daily's JDBC write ---
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-northstar}

@@ -1,10 +1,23 @@
 """Roll the lake up to daily x zone metrics and stage them for the serving store.
 
-Reads the *whole* lake — both writers' halves — and recomputes every day it
-finds. Consistent with the rest of the batch layer: there is no incremental
-state to drift, and a rerun repairs any past mistake. The output is around
-365 days x ~260 zones per year, so a full recompute is trivially cheap
-compared to the bookkeeping that avoiding one would cost.
+Recomputes daily x zone rollups from the lake. Consistent with the rest of the
+batch layer: no incremental state to drift, and a rerun repairs any past
+mistake.
+
+Scope: `--since`, defaulting to the cutoff
+------------------------------------------
+Backfilled history **never changes**. Once 2023-04 is in the lake it is
+identical on every subsequent read, so re-aggregating it every three minutes
+reads tens of millions of rows to produce numbers already in the serving table.
+
+So the recurring DAG aggregates only days after the cutoff — the range the
+Kafka writer actually moves — and the backfill DAG runs one full pass
+(`--since 1970-01-01`) after its months land. The steady-state cost is then
+bounded by how much has been replayed, not by how large the lake is, which is
+what keeps a 3-minute schedule viable as history grows.
+
+Rejected simply lengthening the schedule: it trades a fast dashboard for a
+problem that comes straight back the next time the backfill is extended.
 
 Source independence
 -------------------
@@ -31,6 +44,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -78,11 +92,15 @@ def _metrics(trips: DataFrame, group_by: list) -> DataFrame:
     )
 
 
-def aggregate_daily() -> int:
-    """Recompute daily x zone rollups into the staging table. Returns row count."""
+def aggregate_daily(since: datetime) -> int:
+    """Recompute daily x zone rollups at or after `since`. Returns row count."""
     spark = build_session("aggregate_daily")
 
     lake = spark.read.parquet(config.LAKE_PATH)
+
+    # Partition pruning does the work: year/month/day are directory names, so
+    # Spark skips whole months rather than reading and discarding them.
+    lake = lake.filter(F.col("pickup_datetime") >= F.lit(since))
 
     trips = lake.select(
         # Event-time day. to_date on the canonical event time, never on
@@ -139,9 +157,9 @@ def aggregate_daily() -> int:
     written = staged.count()
     days = staged.select("metric_date").distinct().count()
     logger.info(
-        "%s -> %s: %d daily x zone row(s) across %d day(s) staged. "
+        "%s -> %s: %d daily x zone row(s) across %d day(s) since %s staged. "
         "Run sql/merge_daily.sql to publish.",
-        config.LAKE_PATH, config.STAGING_TABLE, written, days,
+        config.LAKE_PATH, config.STAGING_TABLE, written, days, since.date(),
     )
     staged.unpersist()
     spark.stop()
@@ -149,11 +167,20 @@ def aggregate_daily() -> int:
 
 
 def main() -> int:
-    # No arguments: the grain is fixed and the range is "the whole lake".
-    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--since",
+        default=config.CUTOFF.date().isoformat(),
+        help=(
+            "recompute days from this date onward (YYYY-MM-DD). Defaults to the "
+            "cutoff, which is the only range the Kafka writer changes. Pass an "
+            "early date after a backfill to rebuild history in one pass."
+        ),
+    )
+    args = parser.parse_args()
 
     try:
-        aggregate_daily()
+        aggregate_daily(datetime.fromisoformat(args.since))
     except Exception:  # noqa: BLE001 — log the trace, then fail the task
         logger.exception("daily aggregation failed")
         return 1
