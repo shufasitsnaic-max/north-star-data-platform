@@ -81,6 +81,10 @@ services:
       timeout: 10s
       retries: 10
       start_period: 20s
+    # Long-running infrastructure: come back after a daemon restart. Observed
+    # 2026-08-30 — the dind daemon restarted and every service WITHOUT this
+    # stayed down, which surfaced later as unrelated-looking DNS failures.
+    restart: unless-stopped
 
   gateway:
     build: ./gateway
@@ -101,6 +105,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    restart: unless-stopped
 
   simulator:
     build: ./simulator
@@ -144,6 +149,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    restart: unless-stopped
 
   hot_path:
     build: ./hot_path
@@ -257,6 +263,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    restart: unless-stopped
 
   spark-worker:
     image: apache/spark:3.5.3
@@ -323,6 +330,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    restart: unless-stopped
 
   airflow-init:
     build: ./orchestration
