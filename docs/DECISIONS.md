@@ -15,6 +15,114 @@ useful if it's curated, not a dump.
 
 ---
 
+## Resuming — read this first  · paused 2026-08-30 ~15:10 UTC
+
+All six phases are built. P1-P5 are verified end to end; P6 renders but its newest panels
+have not had a browser pass. One long-running job was left mid-flight.
+
+### State when work stopped
+
+| | |
+|---|---|
+| Lake | 27 of 36 months loaded for 2023-01..2025-12, plus 2026-01..04 from replay |
+| Serving table | ~103k rows / 430 days — **stale**, the backfill's merge has not run yet |
+| Predictions | ~205k over 2026-01-01..04, model `fare-hgb-2` |
+| `cold_path_backfill` | run `manual__2026-08-30T13:14:25+00:00` **still `running`**, DAG **paused** |
+| `cold_path_incremental` | unpaused, healthy, ~121s per run on a 3-minute schedule |
+| Disk | ~6.6GB free of 32GB, shared between `/workspaces` and `/var/lib/docker` |
+
+### First action: finish the backfill
+
+The DAG was **paused mid-run** — most likely toggled by accident in the UI while deleting a
+duplicate run. A paused DAG leaves an in-flight run untouched: it stays `running` with its
+remaining tasks stuck in `scheduled` indefinitely, which reads as a hang rather than a
+setting. Worth knowing because nothing about the symptom points at the cause.
+
+```bash
+cd /workspaces/north-star-data-platform
+docker compose up -d                     # everything; restart policies cover most of it
+docker compose exec airflow-scheduler airflow dags unpause cold_path_backfill
+```
+
+It resumes at map index 27 within ~30s. Nine months remain at ~215s each, 2 concurrent, so
+**~16 minutes**, then `aggregate_history` (one Spark pass over ~110M rows, 10-20 min) and the
+merge.
+
+Confirm it moved rather than assuming:
+
+```bash
+docker compose exec airflow-scheduler airflow tasks states-for-dag-run \
+  cold_path_backfill "manual__2026-08-30T13:14:25+00:00"
+```
+
+Success count climbs to 38 (36 months + `ensure_schema` + `aggregate_history`). Then:
+
+```bash
+docker compose exec -T postgres psql -U northstar -d northstar -c "
+SELECT count(*) AS rows, min(metric_date), max(metric_date),
+       count(DISTINCT metric_date) AS days FROM cold_daily_zone_metrics;"
+```
+
+**~300k rows across ~1,100 days from 2023-01-01** is the target. Until that lands the
+dashboard's history chart still shows three disconnected islands rather than three continuous
+years.
+
+If the run has been marked `failed` by a scheduler restart, do not re-trigger from scratch —
+clear the unfinished tasks instead, since the 27 loaded months need no reloading:
+
+```bash
+docker compose exec airflow-scheduler airflow tasks clear cold_path_backfill \
+  --start-date 2026-08-30 --end-date 2026-08-30 --only-failed --yes
+```
+
+### Then, in order
+
+1. **Browser pass on the dashboard**, the only thing standing between P6 and verified. The
+   palette was validated computationally; layout was never looked at. Check label collisions,
+   column widths and overflow on the scoring feed. Port 8501 needs adding by hand in the
+   PORTS panel until the next container rebuild picks up `devcontainer.json`.
+2. **Longer 2026 replay.** Four event-time days is enough to separate the holiday from normal
+   days, not enough for a weekly or seasonal picture. The sidebar renders the command; ~420
+   events/sec.
+3. **Retrain on the full corpus.** The current model saw 14 months. After the backfill the
+   lake holds 36, and `TRAIN_SAMPLE_ROWS` stratifies across whatever is there. Remember the
+   consumer-group reset afterwards or nothing re-scores — the command is in `predictor.py`.
+
+### Known traps, all previously paid for
+
+- `docker compose run` uses the **cached image**; add `--build` after changing source, or the
+  old code runs and looks like a mystery.
+- `spark-submit --master` is **silently ignored** — set `SPARK_MASTER` in the environment.
+  `--packages` is the opposite: it *must* be on the submit line or in `spark-defaults.conf`,
+  because connectors are resolved before the JVM exists.
+- **Training a new model re-scores nothing** until the Kafka consumer group is reset.
+- **Never evaluate while the predictor is re-scoring** — the evaluation is a full recompute
+  over a table another service is rewriting, and produces rows that do not partition.
+- `devcontainer.json`'s `forwardPorts` is read **only at container creation**; add ports by
+  hand in the PORTS panel meanwhile. Codespaces never exposes ports on the laptop's
+  `localhost` — use the forwarded `*.app.github.dev` URL.
+- Watch **disk**. `/workspaces` and `/var/lib/docker` share one 32GB filesystem, and Spark's
+  worker scratch grew to 8.49GB unnoticed before cleanup was enabled.
+
+### Shutting down
+
+Stopping the codespace is enough — **do not** `docker compose down -v`, which would destroy
+the Kafka log, both databases and Airflow's history. Named volumes and everything under
+`/workspaces` (the lake, the raw files, the model artifact) survive a stop; only container
+writable layers are lost, and nothing of value lives there.
+
+Stop it from github.com/codespaces, or let the idle timeout do it. **Worth doing
+deliberately**: this is a 4-core machine, which burns Student Pack core-hours at twice the
+rate of the default.
+
+On restart the Docker daemon comes back and services carrying `restart: unless-stopped`
+return by themselves; `docker compose up -d` covers the rest. Expect the first Spark submit
+after a restart to re-download connector JARs, since the Ivy cache lives in the container's
+`/tmp`.
+
+
+---
+
 ## Phase 1 — Validation Gateway (FastAPI)  · 2026-07-19
 
 **Status:** complete. All P1 verification cases pass (valid -> 200, corrupt types -> 422,

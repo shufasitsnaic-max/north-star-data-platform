@@ -138,6 +138,9 @@ cd gateway && uv sync && uv run uvicorn main:app
 
 ## Status
 
+> **Picking this up again?** `docs/DECISIONS.md` opens with a **Resuming** section:
+> current state, the one job left mid-flight, and the traps already paid for.
+
 **All six phases built.** Validation gateway, Kafka + producer + replay simulator, hot
 path -> PostgreSQL, the full cold path, the ML layer, and a Streamlit dashboard over
 all of it. Phases 1–5 are verified end-to-end; the dashboard renders against live data
