@@ -34,11 +34,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
+import pandas as pd
 import psycopg
 from confluent_kafka import Consumer, KafkaError
 
 import config
-from features import single_row
+from features import build_features
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("ml.predictor")
@@ -104,26 +105,29 @@ def _load_model():
     return joblib.load(artifact), metadata["model_version"]
 
 
-def _row(event: dict, model, model_version: str) -> tuple | None:
-    """One prediction row, or None if the event is not ours to score."""
+def _prepare(event: dict) -> dict | None:
+    """One event reduced to what scoring needs, or None if it is not ours.
+
+    Deliberately does NOT predict. Scoring one row at a time costs the full
+    scikit-learn pipeline overhead per event — the encoder transform and the
+    booster's own setup — for a single number, which measured at ~120 events/sec
+    against a replay producing ~420/sec. The service could not keep up with its
+    own input. Predictions are made per batch instead, in _flush.
+    """
     pickup = datetime.fromisoformat(event["pickup_datetime"])
     if pickup <= config.CUTOFF:
         return None
 
-    pickup_zone = (event.get("pickup_location") or {}).get("zone_id")
-    dropoff_zone = (event.get("dropoff_location") or {}).get("zone_id")
-
-    features = single_row(pickup, pickup_zone, dropoff_zone, event.get("passenger_count"))
-    predicted = float(model.predict(features)[0])
-
-    # The outcome, recorded for comparison only. Same definition the model was
-    # trained against, computed the same way.
-    actual = float(event["total_amount"]) - float(event["tip_amount"])
-
-    return (
-        event["event_id"], pickup, pickup_zone, dropoff_zone,
-        round(predicted, 2), round(actual, 2), model_version,
-    )
+    return {
+        "event_id": event["event_id"],
+        "pickup_datetime": pickup,
+        "pickup_zone_id": (event.get("pickup_location") or {}).get("zone_id"),
+        "dropoff_zone_id": (event.get("dropoff_location") or {}).get("zone_id"),
+        "passenger_count": event.get("passenger_count"),
+        # The outcome, carried for comparison only. Same definition the model
+        # was trained against, computed the same way.
+        "actual": float(event["total_amount"]) - float(event["tip_amount"]),
+    }
 
 
 def run() -> None:
@@ -165,7 +169,7 @@ def run() -> None:
     consumer.subscribe([config.KAFKA_TOPIC])
     logger.info("consuming %s as group %s", config.KAFKA_TOPIC, config.KAFKA_GROUP_ID)
 
-    batch: list[tuple] = []
+    batch: list[dict] = []
     scored = skipped = 0
     announced_waiting = False
 
@@ -174,7 +178,7 @@ def run() -> None:
 
         if message is None:
             if batch:
-                _flush(connection, consumer, batch)
+                _flush(connection, consumer, batch, model, model_version)
                 batch = []
             continue
 
@@ -192,7 +196,7 @@ def run() -> None:
 
         announced_waiting = False
         try:
-            row = _row(json.loads(message.value()), model, model_version)
+            row = _prepare(json.loads(message.value()))
         except Exception:  # noqa: BLE001 — one bad event must not stop the service
             logger.exception("could not score an event; skipping it")
             continue
@@ -204,25 +208,55 @@ def run() -> None:
         batch.append(row)
         scored += 1
         if len(batch) >= config.WRITE_BATCH_SIZE:
-            _flush(connection, consumer, batch)
+            _flush(connection, consumer, batch, model, model_version)
             batch = []
             logger.info("scored %d event(s), skipped %d at or before the cutoff", scored, skipped)
 
     if batch:
-        _flush(connection, consumer, batch)
+        _flush(connection, consumer, batch, model, model_version)
     consumer.close()
     connection.close()
     logger.info("stopped after scoring %d event(s)", scored)
 
 
-def _flush(connection: psycopg.Connection, consumer: Consumer, batch: list[tuple]) -> None:
-    """Write a batch, then commit offsets — in that order.
+def _flush(
+    connection: psycopg.Connection,
+    consumer: Consumer,
+    batch: list[dict],
+    model,
+    model_version: str,
+) -> None:
+    """Score a whole batch in one call, write it, then commit offsets.
 
-    Committing first would mean a crash between the two lost predictions the
-    consumer believes it has already handled.
+    One predict() over N rows rather than N calls over one row each: the
+    pipeline's fixed cost is paid once per batch instead of once per event.
+
+    Features are built through features.build_features, the same function the
+    training set went through — a batch of N and a batch of 1 take an identical
+    code path, so there is still exactly one definition of a feature row.
+
+    Order matters at the end. Committing offsets before the write would mean a
+    crash between the two loses predictions the consumer believes it has
+    already handled.
     """
+    frame = pd.DataFrame(batch)
+    predictions = model.predict(build_features(frame))
+
+    rows = [
+        (
+            record["event_id"],
+            record["pickup_datetime"],
+            record["pickup_zone_id"],
+            record["dropoff_zone_id"],
+            round(float(predicted), 2),
+            round(record["actual"], 2),
+            model_version,
+        )
+        for record, predicted in zip(batch, predictions)
+    ]
+
     with connection.cursor() as cursor:
-        cursor.executemany(_UPSERT, batch)
+        cursor.executemany(_UPSERT, rows)
     consumer.commit(asynchronous=False)
 
 

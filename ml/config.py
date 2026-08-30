@@ -65,9 +65,18 @@ POSTGRES_DB = os.environ.get("POSTGRES_DB", "northstar")
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "northstar")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "northstar")
 
-# How many predictions to buffer before writing. Matches the hot path's
-# discipline of batching writes rather than one round trip per event.
-WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", "200"))
+# How many events to buffer before scoring and writing them together.
+#
+# Governs both the model call and the database round trip. The model call is
+# what makes it matter: scoring one row at a time paid the full scikit-learn
+# pipeline overhead per event and measured ~120 events/sec against a replay
+# producing ~420/sec, so the service fell steadily behind its own input. One
+# predict() over a batch pays that cost once.
+#
+# 500 rather than 200 because the fixed cost is now amortised over the batch and
+# a larger batch is strictly better for it, while still bounding how many events
+# a crash can force a re-read of.
+WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", "500"))
 
 
 def postgres_dsn() -> str:
