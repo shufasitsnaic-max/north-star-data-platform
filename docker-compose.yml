@@ -394,6 +394,16 @@ services:
         condition: service_completed_successfully
       spark-master:
         condition: service_healthy
+      # The two services this scheduler's *tasks* talk to, not just the ones it
+      # needs to boot. aggregate_daily writes the serving store over JDBC and
+      # stream_to_lake reads the bus, so without these a `docker compose up
+      # airflow-scheduler` yields a scheduler whose every task fails on DNS —
+      # "could not translate host name" reads as a network bug rather than a
+      # container that was simply never started.
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
 
   airflow-webserver:
