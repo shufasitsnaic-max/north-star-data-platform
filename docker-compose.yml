@@ -1,14 +1,19 @@
 # North Star data platform — Compose stack.
 #
-# Phase 2 + 3 services (phase discipline: we don't scaffold later phases here).
-#   kafka      — single-node broker in KRaft mode (no Zookeeper)
-#   gateway    — FastAPI validate -> adapt -> produce to tlc-raw-events
-#   simulator  — one-shot replay job, behind the "replay" profile
-#   postgres   — serving store for hot-path window metrics
-#   hot_path   — Kafka consumer -> event-time windows -> postgres
+# Phase 2 + 3 + 4 services (phase discipline: we don't scaffold later phases here).
+#   kafka         — single-node broker in KRaft mode (no Zookeeper)
+#   gateway       — FastAPI validate -> adapt -> produce to tlc-raw-events
+#   simulator     — one-shot replay job, behind the "replay" profile
+#   postgres      — serving store for hot-path window metrics
+#   hot_path      — Kafka consumer -> event-time windows -> postgres
+#   spark-master  — standalone Spark master for the cold-path jobs
+#   spark-worker  — the one executor host; scale with `--scale spark-worker=N`
 #
 # Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
+# Bring up the cold path:              docker compose up -d spark-master spark-worker
 # Trigger a replay when you're ready:  docker compose run --rm simulator
+# Backfill one month into the lake:
+#   docker compose exec spark-master /opt/spark/bin/spark-submit #     --master spark://spark-master:7077 /opt/batch_jobs/jobs/bulk_load.py --month 2023-01
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
@@ -144,6 +149,85 @@ services:
         condition: service_healthy
     # A worker, not a server: restart it if it dies so a transient broker or
     # database blip doesn't silently stop the hot path.
+    restart: unless-stopped
+
+  # ── Cold path: standalone Spark ────────────────────────────────────────
+  # A master and one worker, rather than local[*] inside a single container.
+  # The point is that the cold-path jobs submit to a real cluster and would run
+  # unchanged against a bigger one — Spark is admittedly oversized for ~45MB a
+  # month, and that portability is the whole argument for it.
+  spark-master:
+    # First-party Apache image, pinned to the exact version batch_jobs/pyproject
+    # pins pyspark to. A client newer than the cluster fails at task
+    # deserialization, so that pin and this tag move together or not at all.
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    # The image ships no default server command; spark-class runs the master in
+    # the foreground, which is what Compose wants (no daemonizing).
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      # Master web UI. On 8081 because 8080 is reserved for Airflow's webserver
+      # in step 5 — moving it later would mean re-teaching the port to muscle
+      # memory and to the devcontainer's forwardPorts.
+      - "8081:8080"
+      # Submit/RPC port, host-facing so a driver can be run from the dev
+      # container during development.
+      - "7077:7077"
+    environment:
+      # Keep the master's own logs off /opt/spark, which the non-default user
+      # below does not own. See the `user:` comment.
+      SPARK_LOG_DIR: /tmp/spark-logs
+    # Run as the dev container's user (uid 1000), not the image's `spark` user
+    # (uid 185). Everything this cluster writes lands in a host bind mount, and
+    # files owned by 185 would be unreadable from the dev container terminal —
+    # which is exactly where the P4 verification reads the lake back with
+    # pyarrow. Owning the output is worth overriding the image default for.
+    user: "1000:1000"
+    volumes:
+      # The lake is read-write and gets an explicit mount, per the
+      # no-ephemeral-state rule. The raw drop is read-only: jobs only read it.
+      - ./data/lake:/data/lake
+      - ./data/raw:/data/raw:ro
+      # The job source, mounted read-only so spark-submit can reach it without
+      # an orchestration image — that image is step 5's problem, not step 2's.
+      - ./batch_jobs:/opt/batch_jobs:ro
+    healthcheck:
+      # The master is ready once its UI answers; workers register against it.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    # No container_name: it would block `docker compose up --scale spark-worker=N`,
+    # which is the cheapest way to show the cold path scaling horizontally.
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    ports:
+      # Worker UI. Range-mapped so scaling past one worker doesn't collide.
+      - "8082-8085:8081"
+    environment:
+      # Explicit limits. Kafka, Postgres, the gateway and the hot path are
+      # already resident on a 16GB codespace; an unbounded worker would claim
+      # most of what Spark can see and leave the rest of the stack thrashing.
+      SPARK_WORKER_CORES: "3"
+      SPARK_WORKER_MEMORY: 4g
+      # Scratch + logs under /tmp for the same ownership reason as the master.
+      SPARK_WORKER_DIR: /tmp/spark-work
+      SPARK_LOG_DIR: /tmp/spark-logs
+    user: "1000:1000"
+    volumes:
+      # Executors write the lake's Parquet files themselves, so the worker needs
+      # the same read-write mount the master has — not a read-only copy.
+      - ./data/lake:/data/lake
+      - ./data/raw:/data/raw:ro
+      - ./batch_jobs:/opt/batch_jobs:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    # A worker, not a server: restart it so a transient master blip doesn't
+    # silently leave the cluster with no executors.
     restart: unless-stopped
 
 volumes:

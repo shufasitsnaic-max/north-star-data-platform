@@ -39,6 +39,14 @@ ENV/
 # directory outright and no negation inside it can match.
 /data/*
 !/data/.gitkeep
+# Same reasoning one level down: Compose bind-mounts ./data/lake into
+# spark-master and spark-worker, so the directory must exist before the
+# first `up` or Docker creates it as root and the executors cannot write
+# their Parquet files into it. Un-ignore the directory, re-ignore its
+# contents, keep the marker.
+!/data/lake/
+/data/lake/*
+!/data/lake/.gitkeep
 *.parquet
 *.arrow
 # Raw trip files (un-ignore a small sample below if you want one in-repo)
