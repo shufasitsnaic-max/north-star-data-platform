@@ -137,9 +137,20 @@ def run() -> None:
         {
             "bootstrap.servers": config.KAFKA_BOOTSTRAP_SERVERS,
             "group.id": config.KAFKA_GROUP_ID,
-            # Score the whole post-cutoff history on a fresh group, so a
-            # restart rebuilds every prediction rather than silently leaving a
-            # gap the evaluation would read as a quiet day.
+            # Applies only to a group with no committed offsets, i.e. the
+            # first ever start. A restart afterwards resumes where it left off,
+            # which is what you want in normal operation.
+            #
+            # The consequence is an operational step worth knowing: **changing
+            # the model does not re-score anything.** Existing rows keep their
+            # old prediction and old model_version forever, because the group
+            # has already read past them. To re-score after training a new
+            # version, stop this service and reset the group:
+            #
+            #   docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh             #     --bootstrap-server localhost:9092 --group ml-predictor             #     --topic tlc-raw-events --reset-offsets --to-earliest --execute
+            #
+            # The upsert on event_id then rewrites each row in place rather than
+            # duplicating it.
             "auto.offset.reset": "earliest",
             # Offsets are committed only after a batch is written, so a crash
             # re-delivers rather than loses. The upsert makes that harmless.
