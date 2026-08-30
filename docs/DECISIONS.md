@@ -1292,11 +1292,162 @@ decision taken today; the remaining months need only an extended list and a re-t
   bounded by Kafka retention rather than by the lake. Worth re-measuring in step 6 once
   a long replay has built up real topic volume.
 
+
+## Phase 5 — ML: fare estimation at pickup  · 2026-08-30
+
+**Status: IN PROGRESS — trained and scoring; daily evaluation not yet run end to end.**
+
+### The task changed, and why
+
+Recorded earlier as per-trip **tip prediction**. Re-examined at the start of P5 and
+replaced with **fare estimation at pickup**. Tip prediction was the weakest thing in the
+plan, for three reasons worth keeping because they generalise:
+
+- **It was mostly a data artifact.** TLC records tips only for card payments; cash tips are
+  logged as zero. A third of the labels would have been structurally wrong, and a model
+  trained on all of them learns "cash implies no tip", which is a recording convention, not
+  behaviour.
+- **It was nearly determined by another column in the same row.** Card tips cluster tightly
+  around a percentage of fare, so `tip ~= 0.2 x fare_amount` is most of the model. The
+  metrics would have looked excellent while demonstrating almost nothing.
+- **Nobody acts on a predicted tip.** There is no decision it informs.
+
+**Chosen instead: predict what the ride will cost, before it starts.** The rider sees an
+estimate and decides whether to book — the upfront-pricing model. The same predictions
+support dispatch, and the daily error metric doubles as a drift detector, which is what
+makes P6's alerts panel a real feature rather than a decoration.
+
+**Target: `total_amount - tip_amount`** — everything the rider is charged except the part
+they choose. Rejected `total_amount`, which folds the tip back in and drags the cash
+artifact along with it. Rejected `fare_amount` alone, which omits tolls and surcharges that
+a rider genuinely pays and would make the estimate systematically low on tunnel and
+congestion-zone trips.
+
+### Features: only what is known before the wheels turn
+
+Pickup zone, dropoff zone, the encoded zone pair, hour, day of week, month, passenger count.
+
+**`trip_distance_km` and `dropoff_datetime` are deliberately excluded.** Both are realised
+quantities. Including either would produce an excellent model and a fake prediction — you
+cannot quote a price using the distance a taxi has not driven yet. The zone pair carries
+distance implicitly, and learning that mapping is the entire job.
+
+Every feature is canonical. Nothing in `ml/` reads `source_extras`, so the layer names no
+source — a stronger position than the tip model would have held, since that one wanted
+`fare_amount`. `ratecode_id` was dropped for the same reason despite P2 flagging it as a
+candidate: it lives in `source_extras`, and reaching in would make the ML layer
+source-aware.
+
+### The negative result that justified the baselines
+
+`train.py` reports three models: a global median floor, a **zone-pair median lookup** a
+business could build in an afternoon, and the gradient booster. The first version:
+
+| model | MAE | RMSE | R2 |
+|-------|-----|------|-----|
+| global median | $11.13 | $19.72 | -0.11 |
+| zone-pair median | $4.24 | $8.66 | 0.786 |
+| gradient boosting (v1) | $6.06 | $10.05 | 0.712 |
+
+**The model lost to its own baseline by 43%.** Without the lookup we would have shipped
+"MAE $6.06, R2 0.71" and called it a success.
+
+Diagnosis: the two zones were target-encoded **independently**, which destroys the
+interaction that sets the price. "Midtown" averages ~$18 and "JFK" averages ~$60, but
+neither marginal says that *this pair* is a long airport run. Two marginals cannot
+reconstruct 69k pair-specific prices; the lookup keeps exactly that information.
+
+Fix: encode the zone pair as its own feature, so the model starts from what the lookup
+knows and adds what it cannot express.
+
+| model | MAE | RMSE | R2 |
+|-------|-----|------|-----|
+| zone-pair median | $4.24 | $8.66 | 0.786 |
+| gradient boosting (v2) | **$3.91** | $7.91 | **0.822** |
+
+**Beats the lookup by 7.8%.** Modest, and that modesty is the finding: the route determines
+most of what a ride costs, and hour, weekday and season add about eight percent on top.
+That is a more informative claim than a large number would have been, and it is only
+available because the baseline exists.
+
+### Design decisions
+
+- **`features.py` is shared by training and serving.** Training/serving skew raises no
+  error; it silently returns wrong numbers. One definition of a feature row, one column
+  order, imported by both sides.
+- **Zones are target-encoded, not categorical.** TLC has 265 zones and
+  HistGradientBoosting caps native categorical cardinality at `max_bins` (255), so zone ids
+  as categories fail at fit time. Target encoding is also the better representation — an
+  encoded zone *is* "what trips from here typically cost" — and scikit-learn's
+  `TargetEncoder` cross-fits, so a row's encoding never comes from its own target.
+- **`loss="absolute_error"`**, because the quoted metric is "typically within $X". Squared
+  error would trade many small errors for a few large ones, which is the wrong bargain for
+  a price estimate.
+- **The holdout is chronological, not random.** Fit on records at or before the cutoff;
+  score only records after it. The predictor skips pre-cutoff events still on the topic —
+  quoting a price for a trip the model trained on would flatter it.
+- **Evaluation is pure SQL**, because the predictor records the outcome beside the quote.
+  The orchestration image therefore needs no scikit-learn and never touches the artifact.
+  Rejected a Spark job joining predictions against the lake: more independent, but it needs
+  a whole job, an `ml/` mount into the Spark containers, and a second definition of the
+  target.
+- **One image for `ml_train` and `ml_predictor`.** A model pickled by one scikit-learn
+  version and unpickled by another may load and answer differently rather than failing.
+  Sharing an image makes the versions impossible to diverge.
+
+### The holiday finding — the one to talk about
+
+The model systematically under-quoted its very first day of live scoring: predicted $21.88
+against $33.58 actual on 2026-01-01.
+
+The obvious explanation was wrong. The first hypothesis was that 2026 fares had risen — a
+regime shift. The cold path's own daily aggregates refuted it: **2026-01-02 averages $30.59
+per trip, squarely inside late December's $27.71-$32.69 range.** No shift.
+
+What actually happened is narrower and more interesting. **2026-01-01 averages $36.11, far
+above every surrounding day** — New Year's Day has about a fifth of the usual trip volume
+(19,625 against ~100,000) and the trips that do happen are longer and pricier.
+
+**The model cannot know this.** Its calendar features are hour, day-of-week and month.
+1 January 2026 is a Thursday, so it confidently priced a normal January Thursday. There is
+no holiday feature.
+
+Why this is worth presenting rather than hiding:
+
+- The daily evaluation caught a real, explicable model weakness on its first run. That is
+  precisely what a daily evaluation is *for*, and it demonstrates the ML layer working as a
+  system rather than as a metric.
+- The fix is obvious and nameable — a holiday/calendar flag — without having to be built.
+  Knowing what is missing is a result.
+- It makes P6's alerts panel meaningful: a spike in daily MAE against a stable baseline is
+  exactly the alert worth showing.
+
+### The caveat on every forward number so far
+
+Three compounding limits, all of which resolve with more replay:
+
+1. **The prediction set spans ~1.5 event-time days** — all of 2026-01-01 and 2026-01-02
+   until 07:53. That is the whole of what the simulator has replayed past the cutoff.
+2. **One of those two days is an extreme holiday**, so half the forward evidence is an
+   outlier.
+3. **That holiday is double-weighted.** 2026-01-01 was deliberately replayed twice in P4
+   step 3 to test the cold path's dedupe. The cold path collapsed the duplicates; the
+   predictor did not, because the gateway mints a fresh `event_id` per request — so
+   `fare_predictions` holds 39,250 Jan-1 rows against Jan-2's 19,561. **Roughly two thirds
+   of the prediction table is New Year's Day.**
+
+Consequence: the pooled `avg_predicted` / `avg_actual` figures are not a fair summary of
+the model. The per-day `ml_daily_eval` rows are unaffected, since they group by event-time
+date. Do not quote a headline forward MAE until a longer replay has run.
+
 ---
 
 ## Open / deferred decisions (cross-phase)
 
-- **ML task.** Per-trip **tip prediction** is the core model: train on <=cutoff records,
+- **ML task — SUPERSEDED 2026-08-30, see Phase 5.** Replaced by fare estimation at pickup;
+  tip prediction was mostly a recording artifact (cash tips are logged as zero) and nearly
+  determined by `fare_amount`. Original text kept for the record:
+  Per-trip **tip prediction** is the core model: train on <=cutoff records,
   predict as later records replay, compare predicted vs actual, and run a daily Airflow
   evaluation (maps onto the rubric's "compare earlier predictions with actual" +
   "evaluate every day"). Aggregate demand/revenue **forecasting** remains a possible
