@@ -1,0 +1,22 @@
+# Pinned to a light theme rather than following the viewer's OS setting.
+#
+# The chart palette was validated for contrast against a specific surface
+# (#fcfcfb). Letting the theme flip to dark would silently invalidate those
+# contrast figures — a dark mode needs its own steps from the same ramps,
+# chosen and re-validated, not an automatic inversion.
+[theme]
+base = "light"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f2f1ee"
+textColor = "#0b0b0b"
+primaryColor = "#2a78d6"
+
+[server]
+headless = true
+# The dashboard is behind Compose and a codespace port forward; neither needs
+# Streamlit's usage telemetry or its CORS assumptions about a local browser.
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

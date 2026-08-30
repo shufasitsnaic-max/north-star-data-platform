@@ -11,6 +11,7 @@
 #   airflow-*     — metadata DB, one-shot init, scheduler, webserver (8080)
 #   ml_train      — one-shot fit, behind the "train" profile
 #   ml_predictor  — quotes a price for each post-cutoff event as it replays
+#   dashboard     — Streamlit, read-only over the serving store (8501)
 #
 # Bring up the long-running core:      docker compose up -d kafka gateway postgres hot_path
 # Bring up the cold path:              docker compose up -d spark-master spark-worker
@@ -38,6 +39,9 @@
 # Train the fare model, then start scoring the replayed stream:
 #   docker compose run --rm ml_train
 #   docker compose up -d ml_predictor
+#
+# Open the dashboard:
+#   docker compose up -d dashboard   →  http://localhost:8501
 #
 # Every stateful service gets an explicit named volume (no ephemeral data).
 
@@ -504,6 +508,36 @@ services:
         condition: service_healthy
     # A worker, not a server: restart so a transient broker or database blip
     # does not silently stop scoring.
+    restart: unless-stopped
+
+  # -- Dashboard -------------------------------------------------------------
+  # A read-only view over the serving store. It owns no tables and writes
+  # nothing, so it can be restarted mid-demo without any other component
+  # noticing — and a bug here cannot corrupt data.
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-northstar}
+      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-northstar}
+    depends_on:
+      # Only the serving store. The dashboard reads tables, not services: the
+      # hot path, cold path and ML layer can each be down and the page still
+      # renders whatever they last wrote.
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Streamlit ships its own health endpoint. stdlib rather than curl, since
+      # the slim base has no curl — the same trap the Spark healthcheck hit.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health').status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
 
 volumes:

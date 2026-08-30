@@ -1,0 +1,22 @@
+# Streamlit dashboard over the serving store. Its own uv project like every
+# other component — no shared environment, no requirements.txt (see CLAUDE.md).
+#
+# Read-only by design: it owns no tables and writes nothing, so it can be
+# restarted mid-demo without any other component noticing.
+
+[project]
+name = "dashboard"
+version = "0.1.0"
+description = "Streamlit view over hot metrics, cold trends, predictions and alerts"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit==1.41.1",
+    # Charting. Streamlit already depends on Altair, but this file imports it
+    # directly, so it is declared directly — a transitive dependency is not a
+    # promise.
+    "altair==5.5.0",
+    # Same version the hot path and ML layer use, so every component in the
+    # platform speaks to PostgreSQL through one client generation.
+    "psycopg[binary]==3.2.3",
+    "pandas==2.2.3",
+]
