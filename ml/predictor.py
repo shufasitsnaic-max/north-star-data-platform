@@ -147,7 +147,9 @@ def run() -> None:
             # has already read past them. To re-score after training a new
             # version, stop this service and reset the group:
             #
-            #   docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh             #     --bootstrap-server localhost:9092 --group ml-predictor             #     --topic tlc-raw-events --reset-offsets --to-earliest --execute
+            #   docker compose stop ml_predictor
+            #   docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group ml-predictor --topic tlc-raw-events --reset-offsets --to-earliest --execute
+            #   docker compose start ml_predictor
             #
             # The upsert on event_id then rewrites each row in place rather than
             # duplicating it.
