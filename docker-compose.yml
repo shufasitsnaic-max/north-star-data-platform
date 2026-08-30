@@ -177,6 +177,9 @@ services:
       # Keep the master's own logs off /opt/spark, which the non-default user
       # below does not own. See the `user:` comment.
       SPARK_LOG_DIR: /tmp/spark-logs
+      # The image has no home directory for uid 1000, and the JVM will try to
+      # use one. Point it somewhere writable rather than let it guess.
+      HOME: /tmp
     # Run as the dev container's user (uid 1000), not the image's `spark` user
     # (uid 185). Everything this cluster writes lands in a host bind mount, and
     # files owned by 185 would be unreadable from the dev container terminal —
@@ -191,9 +194,18 @@ services:
       # The job source, mounted read-only so spark-submit can reach it without
       # an orchestration image — that image is step 5's problem, not step 2's.
       - ./batch_jobs:/opt/batch_jobs:ro
+      # Makes uid 1000 a *resolvable* user inside the container, not just a
+      # number. Hadoop's UnixLoginModule builds a UnixPrincipal from the passwd
+      # entry, and with no entry it hands the constructor a null name and dies
+      # with `KerberosAuthException: failure to login` before Spark starts. This
+      # is identity resolution, not permissions — chmod would not have helped.
+      - /etc/passwd:/etc/passwd:ro
     healthcheck:
-      # The master is ready once its UI answers; workers register against it.
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080 >/dev/null || exit 1"]
+      # Readiness = the RPC port accepts connections, which is what the worker
+      # and every spark-submit actually need. Tested with bash's /dev/tcp
+      # because this image ships no curl and no wget — a healthcheck that can
+      # never pass would leave the worker waiting on `service_healthy` forever.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/7077' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -216,6 +228,7 @@ services:
       # Scratch + logs under /tmp for the same ownership reason as the master.
       SPARK_WORKER_DIR: /tmp/spark-work
       SPARK_LOG_DIR: /tmp/spark-logs
+      HOME: /tmp
     user: "1000:1000"
     volumes:
       # Executors write the lake's Parquet files themselves, so the worker needs
@@ -223,6 +236,9 @@ services:
       - ./data/lake:/data/lake
       - ./data/raw:/data/raw:ro
       - ./batch_jobs:/opt/batch_jobs:ro
+      # Same reason as the master: uid 1000 must resolve to a name or Hadoop's
+      # login fails before the worker starts.
+      - /etc/passwd:/etc/passwd:ro
     depends_on:
       spark-master:
         condition: service_healthy
