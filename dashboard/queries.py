@@ -139,19 +139,70 @@ def daily_eval() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=30)
-def recent_predictions(limit: int = 250) -> pd.DataFrame:
-    """Individual quotes, newest first — the per-trip view behind the averages."""
+@st.cache_data(ttl=10)
+def live_predictions(start, end, limit: int = 300) -> pd.DataFrame:
+    """The scoring feed: individual quotes in the selected range, newest first.
+
+    Predicted and actual sit side by side because they arrive together — a
+    replayed event describes a finished trip, so it carries the fare with it.
+    The error is computed in SQL rather than in pandas so the same definition
+    serves the table and any future aggregate over it.
+    """
     return _fetch(
         """
-        SELECT pickup_datetime, pickup_zone_id, dropoff_zone_id,
-               predicted_amount, actual_amount,
-               predicted_amount - actual_amount AS error
+        SELECT pickup_datetime,
+               dropoff_datetime,
+               pickup_zone_id,
+               dropoff_zone_id,
+               predicted_amount,
+               actual_amount,
+               predicted_amount - actual_amount AS error,
+               CASE WHEN actual_amount <> 0
+                    THEN 100 * (predicted_amount - actual_amount) / abs(actual_amount)
+               END AS error_pct
         FROM fare_predictions
+        WHERE pickup_datetime >= %s AND pickup_datetime < %s
         ORDER BY pickup_datetime DESC
         LIMIT %s
         """,
-        (limit,),
+        (start, end, limit),
+    )
+
+
+@st.cache_data(ttl=10)
+def prediction_windows(start, end) -> pd.DataFrame:
+    """Quoted vs charged, averaged into 5-minute event-time windows.
+
+    The same grain the hot path uses, so the two live panels are directly
+    comparable. This is the chart that *grows* as a replay advances: each new
+    window appends a point rather than redrawing history.
+    """
+    return _fetch(
+        """
+        SELECT date_trunc('hour', pickup_datetime)
+                 + (floor(date_part('minute', pickup_datetime) / 5) * interval '5 minutes')
+                 AS window_start,
+               count(*)              AS trips,
+               avg(predicted_amount) AS predicted,
+               avg(actual_amount)    AS actual
+        FROM fare_predictions
+        WHERE pickup_datetime >= %s AND pickup_datetime < %s
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        (start, end),
+    )
+
+
+@st.cache_data(ttl=30)
+def prediction_range() -> pd.DataFrame:
+    """Earliest and latest scored event time — the bounds of the date filter."""
+    return _fetch(
+        """
+        SELECT min(pickup_datetime)::date AS first_day,
+               max(pickup_datetime)::date AS last_day
+        FROM fare_predictions
+        """
     )
 
 

@@ -52,10 +52,11 @@ _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
 # redelivered.
 _UPSERT = """
 INSERT INTO fare_predictions (
-    event_id, pickup_datetime, pickup_zone_id, dropoff_zone_id,
+    event_id, pickup_datetime, dropoff_datetime, pickup_zone_id, dropoff_zone_id,
     predicted_amount, actual_amount, model_version, predicted_at
-) VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
 ON CONFLICT (event_id) DO UPDATE SET
+    dropoff_datetime = EXCLUDED.dropoff_datetime,
     predicted_amount = EXCLUDED.predicted_amount,
     actual_amount    = EXCLUDED.actual_amount,
     model_version    = EXCLUDED.model_version,
@@ -121,6 +122,9 @@ def _prepare(event: dict) -> dict | None:
     return {
         "event_id": event["event_id"],
         "pickup_datetime": pickup,
+        # Recorded for display only — the model is never given it, because at
+        # quoting time the trip has not happened.
+        "dropoff_datetime": datetime.fromisoformat(event["dropoff_datetime"]),
         "pickup_zone_id": (event.get("pickup_location") or {}).get("zone_id"),
         "dropoff_zone_id": (event.get("dropoff_location") or {}).get("zone_id"),
         "passenger_count": event.get("passenger_count"),
@@ -246,6 +250,7 @@ def _flush(
         (
             record["event_id"],
             record["pickup_datetime"],
+            record["dropoff_datetime"],
             record["pickup_zone_id"],
             record["dropoff_zone_id"],
             round(float(predicted), 2),

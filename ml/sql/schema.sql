@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS fare_predictions (
     -- day's accuracy is the accuracy for trips that *happened* that day.
     pickup_datetime  timestamp   NOT NULL,
 
+    -- Carried so the dashboard can show trip duration beside the quote. Not a
+    -- feature: the model never sees it, because at pickup it does not exist.
+    dropoff_datetime timestamp,
+
     pickup_zone_id   integer,
     dropoff_zone_id  integer,
 
@@ -79,3 +83,10 @@ CREATE TABLE IF NOT EXISTS ml_daily_eval (
 -- The dashboard's read pattern: the recent error trend, newest first.
 CREATE INDEX IF NOT EXISTS ml_daily_eval_recent
     ON ml_daily_eval (eval_date DESC);
+
+-- Added after the table already existed in a running system. Written as an
+-- explicit ALTER rather than only in the CREATE above, because CREATE TABLE IF
+-- NOT EXISTS is a no-op against an existing table and the column would never
+-- appear. Rows written before this stay NULL, which the dashboard renders as a
+-- blank rather than inventing a value.
+ALTER TABLE fare_predictions ADD COLUMN IF NOT EXISTS dropoff_datetime timestamp;

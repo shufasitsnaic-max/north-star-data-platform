@@ -18,6 +18,8 @@ Chart conventions, applied throughout:
 
 from __future__ import annotations
 
+from datetime import date, datetime, time
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -71,6 +73,71 @@ st.caption(
 )
 
 alert_slot = st.container()
+
+# ---------------------------------------------------------------------------
+# Controls. The dashboard stays strictly read-only: it filters the *view* and
+# hands you the command to drive the simulation, rather than launching
+# containers itself. Starting a replay from a web page would mean mounting the
+# Docker socket into it, trading a real architectural property — this thing
+# cannot break anything — for a button.
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("View")
+
+    bounds = queries.prediction_range()
+    has_predictions = not bounds.empty and pd.notna(bounds.iloc[0]["first_day"])
+    if has_predictions:
+        first_day = bounds.iloc[0]["first_day"]
+        last_day = bounds.iloc[0]["last_day"]
+        picked = st.date_input(
+            "Event-time range",
+            value=(first_day, last_day),
+            min_value=first_day,
+            max_value=last_day,
+            help="Filters the live feed and the quoted-vs-charged chart. Event time "
+            "— when the trips happened, not when they were scored.",
+        )
+        # A partially-chosen range comes back as a 1-tuple mid-interaction.
+        range_start = picked[0] if isinstance(picked, tuple) else picked
+        range_end = picked[1] if isinstance(picked, tuple) and len(picked) > 1 else range_start
+    else:
+        range_start = range_end = date.today()
+
+    st.divider()
+    st.header("Replay")
+    st.caption(
+        "Predictions cover 2026 onward only — everything at or before the cutoff "
+        "is what the model was trained on."
+    )
+    replay_from = st.date_input(
+        "Simulate from",
+        value=date(2026, 1, 1),
+        min_value=date(2026, 1, 1),
+        max_value=date(2026, 5, 31),
+        key="replay_from",
+    )
+    replay_rows = st.select_slider(
+        "Events", options=[20_000, 50_000, 150_000, 500_000, 1_000_000], value=150_000
+    )
+    st.caption("Run this in the repo root:")
+    # Built by joining a list rather than with line continuations, so the
+    # rendered command is one copy-pasteable line and the source has no
+    # escaping to get wrong.
+    st.code(
+        " ".join([
+            "docker compose run --rm",
+            f"-e MAX_ROWS={replay_rows}",
+            f"-e START_DATETIME={replay_from.isoformat()}T00:00:00",
+            "simulator",
+        ]),
+        language="bash",
+    )
+    st.caption(
+        f"~{replay_rows // 420 // 60 or 1} min at the measured ~420 events/sec. "
+        "The predictor scores them as they arrive; the cold path folds them in on "
+        "its next 3-minute tick."
+    )
 
 # ---------------------------------------------------------------------------
 # Live hot path. Fragment-scoped so it refreshes on its own without redrawing
@@ -286,13 +353,146 @@ else:
             use_container_width=True,
         )
 
-    with st.expander("Per-trip quotes — the rows behind the averages"):
-        st.dataframe(queries.recent_predictions(), use_container_width=True, height=320)
-
     with st.expander("Daily evaluation table"):
         # A table view is not a fallback; it is how a reader checks a chart, and
         # how anyone who cannot read the colours gets the same information.
         st.dataframe(evaluation, use_container_width=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Live scoring feed. Its own fragment so it keeps up with a running replay
+# without redrawing the three-year history above it.
+# ---------------------------------------------------------------------------
+
+# Error bands, as percentages of the actual price. Named so the caption, the
+# colouring and the legend cannot drift apart.
+_BANDS = [(10.0, "good", "within 10%"), (25.0, "warning", "10-25% off"), (None, "critical", "over 25% off")]
+
+
+def _band(error_pct: float) -> str:
+    """Which band an error falls in. Absolute: over- and under-quoting are both wrong."""
+    if pd.isna(error_pct):
+        return "good"
+    magnitude = abs(float(error_pct))
+    for threshold, status, _ in _BANDS:
+        if threshold is None or magnitude < threshold:
+            return status
+    return "critical"
+
+
+@st.fragment(run_every="10s")
+def scoring_feed(start, end) -> None:
+    st.subheader("Live — fare quotes as they are scored")
+    st.caption(
+        "Every trip the model has priced in the selected range, newest first. Quoted "
+        "and charged sit side by side because they arrive together: a replayed event "
+        "describes a finished trip, so it carries its own fare. The model never sees "
+        "that fare, the distance, or the dropoff time."
+    )
+
+    feed = queries.live_predictions(start, end)
+    if feed.empty:
+        st.info(
+            "No quotes in this range. Predictions cover 2026 onward — pick a later "
+            "range, or start a replay with the command in the sidebar."
+        )
+        return
+
+    money = ["predicted_amount", "actual_amount", "error", "error_pct"]
+    feed[money] = feed[money].astype(float)
+    feed["duration_min"] = (
+        pd.to_datetime(feed["dropoff_datetime"]) - pd.to_datetime(feed["pickup_datetime"])
+    ).dt.total_seconds() / 60
+
+    within_10 = float((feed["error_pct"].abs() < 10).mean() * 100)
+    left, middle, right = st.columns(3)
+    left.metric("Quotes shown", f"{len(feed):,}")
+    middle.metric("Within 10%", f"{within_10:.0f}%")
+    right.metric("Median error", f"${feed['error'].abs().median():.2f}")
+
+    st.altair_chart(
+        alt.Chart(queries.prediction_windows(start, end).astype(
+            {"predicted": float, "actual": float}
+        ).melt(
+            id_vars="window_start",
+            value_vars=["actual", "predicted"],
+            var_name="series",
+            value_name="amount",
+        ).replace({"actual": "Charged", "predicted": "Quoted"}))
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("window_start:T", title="Event time"),
+            y=alt.Y("amount:Q", title="Average price ($)", scale=alt.Scale(zero=False)),
+            # Fixed domain: charged stays blue even if a series is filtered out.
+            color=alt.Color(
+                "series:N",
+                title=None,
+                scale=alt.Scale(
+                    domain=["Charged", "Quoted"],
+                    range=[theme.COLOR_ACTUAL, theme.COLOR_PREDICTED],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("window_start:T", title="Window"),
+                alt.Tooltip("series:N", title=None),
+                alt.Tooltip("amount:Q", title="Average", format="$.2f"),
+            ],
+        )
+        .properties(height=220, title="Quoted vs charged, per 5-minute window")
+        .interactive(),
+        use_container_width=True,
+    )
+
+    st.caption(
+        f"Error band: {theme.STATUS_ICON['good']} within 10%  ·  "
+        f"{theme.STATUS_ICON['warning']} 10-25% off  ·  "
+        f"{theme.STATUS_ICON['critical']} over 25% off. "
+        "A positive error means the model quoted more than the trip cost."
+    )
+
+    table = feed[[
+        "pickup_datetime", "dropoff_datetime", "duration_min",
+        "pickup_zone_id", "dropoff_zone_id",
+        "predicted_amount", "actual_amount", "error", "error_pct",
+    ]]
+
+    # The colour reinforces the number; it never replaces it. A reader who
+    # cannot distinguish the hues still has the percentage in the same cell,
+    # which is the whole reason the band is not encoded as a bare dot.
+    styled = table.style.map(
+        lambda v: f"color: {theme.STATUS[_band(v)]}; font-weight: 600",
+        subset=["error_pct"],
+    ).format({
+        "predicted_amount": "${:.2f}",
+        "actual_amount": "${:.2f}",
+        "error": "{:+.2f}",
+        "error_pct": "{:+.1f}%",
+        "duration_min": "{:.0f} min",
+    })
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=420,
+        column_config={
+            "pickup_datetime": st.column_config.DatetimeColumn("Pickup", format="MMM DD HH:mm"),
+            "dropoff_datetime": st.column_config.DatetimeColumn("Dropoff", format="MMM DD HH:mm"),
+            "duration_min": st.column_config.TextColumn("Duration"),
+            "pickup_zone_id": st.column_config.NumberColumn("From zone"),
+            "dropoff_zone_id": st.column_config.NumberColumn("To zone"),
+            "predicted_amount": st.column_config.TextColumn("Quoted"),
+            "actual_amount": st.column_config.TextColumn("Charged"),
+            "error": st.column_config.TextColumn("Error"),
+            "error_pct": st.column_config.TextColumn("Error %"),
+        },
+    )
+
+
+scoring_feed(
+    datetime.combine(range_start, time.min),
+    datetime.combine(range_end, time.max),
+)
 
 # ---------------------------------------------------------------------------
 # Alerts — rendered into the slot reserved at the top
