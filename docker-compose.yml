@@ -201,12 +201,24 @@ services:
       # is identity resolution, not permissions — chmod would not have helped.
       - /etc/passwd:/etc/passwd:ro
     healthcheck:
-      # Readiness = the RPC port accepts connections, which is what the worker
-      # and every spark-submit actually need. Tested with bash's /dev/tcp
-      # because this image ships no curl and no wget — a healthcheck that can
-      # never pass would leave the worker waiting on `service_healthy` forever.
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/7077' || exit 1"]
-      interval: 10s
+      # Tested with bash's /dev/tcp because this image ships no curl and no
+      # wget — a healthcheck that can never pass leaves the worker waiting on
+      # `service_healthy` forever, which reads as a registration bug.
+      #
+      # Probes the web UI, not the RPC port: a raw TCP connect to 7077 sends no
+      # valid RPC handshake, so the master logs a netty stack trace and
+      # "got disassociated, removing it" on every single check.
+      #
+      # The RPC fallback exists because the two ports bind differently. The
+      # master's RPC endpoint binds to the address its hostname resolves to, so
+      # localhost:7077 is refused even when the master is perfectly healthy
+      # (measured). The UI is expected on 0.0.0.0, but rather than bet the
+      # worker's startup on that, fall back to the address the RPC port is
+      # known to answer on.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8080 || </dev/tcp/$$(hostname)/7077' || exit 1"]
+      # 15s rather than 10s: nothing downstream needs sub-minute detection, and
+      # a cold JVM start is the only case that matters here.
+      interval: 15s
       timeout: 5s
       retries: 10
       start_period: 20s
