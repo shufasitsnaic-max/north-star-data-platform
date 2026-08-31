@@ -54,37 +54,62 @@ def _fetch(sql: str, params: tuple = ()) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 @st.cache_data(ttl=5)
-def hot_windows(limit: int = 96) -> pd.DataFrame:
-    """Recent citywide windows, oldest first for plotting.
+def hot_windows(start, end, limit: int = 96) -> pd.DataFrame:
+    """Recent citywide windows in the selected range, oldest first for plotting.
 
     `zone_id IS NULL` is the citywide rollup, not a missing value — the hot path
     writes one such row per window alongside the per-zone rows.
+
+    Bounded by the same range as the quote feed, and for a second reason beyond
+    consistency: an unbounded "latest window" is only ever as sane as the newest
+    row in the table, so a single stray future-dated event hijacks the whole
+    panel. A bound makes that failure mode impossible rather than unlikely.
+    `end=None` is open-ended, as elsewhere.
     """
+    upper = "AND window_start < %s" if end is not None else ""
+    params = (start, end, limit) if end is not None else (start, limit)
     return _fetch(
-        """
+        f"""
         SELECT window_start, trip_count, total_revenue, avg_fare, avg_tip, is_final
         FROM trip_window_metrics
         WHERE zone_id IS NULL
+          AND window_start >= %s
+          {upper}
         ORDER BY window_start DESC
         LIMIT %s
         """,
-        (limit,),
+        params,
     ).sort_values("window_start")
 
 
 @st.cache_data(ttl=5)
-def hot_top_zones(limit: int = 10) -> pd.DataFrame:
-    """Busiest pickup zones in the most recent window."""
+def hot_top_zones(start, end, limit: int = 10) -> pd.DataFrame:
+    """Busiest pickup zones in the most recent window *within the range*.
+
+    The subquery carries the same bounds as the outer one deliberately. Picking
+    the newest window globally and then filtering its zones would silently show
+    an empty chart whenever the newest window falls outside the range — the two
+    have to agree on which window "latest" means.
+    """
+    upper = "AND window_start < %s" if end is not None else ""
+    window_params = (start, end) if end is not None else (start,)
+    params = (*window_params, *window_params, limit)
     return _fetch(
-        """
+        f"""
         SELECT zone_id, trip_count, avg_fare
         FROM trip_window_metrics
         WHERE zone_id IS NOT NULL
-          AND window_start = (SELECT max(window_start) FROM trip_window_metrics)
+          AND window_start >= %s
+          {upper}
+          AND window_start = (
+              SELECT max(window_start) FROM trip_window_metrics
+              WHERE window_start >= %s
+                {upper}
+          )
         ORDER BY trip_count DESC
         LIMIT %s
         """,
-        (limit,),
+        params,
     )
 
 

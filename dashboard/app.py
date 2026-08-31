@@ -165,16 +165,20 @@ with st.sidebar:
 
 
 @st.fragment(run_every="10s")
-def hot_panel() -> None:
+def hot_panel(start, end) -> None:
     st.subheader("Live — hot path")
     st.caption(
         "Five-minute event-time windows, written by the Kafka consumer seconds after "
-        "each trip replays. Refreshes every 10 seconds."
+        "each trip replays. Refreshes every 10 seconds, within the selected range."
     )
 
-    windows = queries.hot_windows()
+    windows = queries.hot_windows(start, end)
     if windows.empty:
-        st.info("No windows yet. Start a replay: `docker compose run --rm simulator`")
+        st.info(
+            "No windows in this range. Either nothing has replayed into it yet, or the "
+            "range excludes what has — widen it, or start a replay with the command in "
+            "the sidebar."
+        )
         return
 
     latest = windows.iloc[-1]
@@ -198,7 +202,7 @@ def hot_panel() -> None:
         use_container_width=True,
     )
 
-    zones = queries.hot_top_zones()
+    zones = queries.hot_top_zones(start, end)
     if not zones.empty:
         st.caption("Busiest pickup zones in the latest window")
         st.altair_chart(
@@ -220,7 +224,10 @@ def hot_panel() -> None:
         )
 
 
-hot_panel()
+hot_panel(
+    datetime.combine(range_start, time.min),
+    None if follow_live else datetime.combine(range_end, time.max),
+)
 st.divider()
 
 # ---------------------------------------------------------------------------
