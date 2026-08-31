@@ -26,6 +26,15 @@ import streamlit as st
 import config
 
 
+# Simulation only ever replays 2026 onward. Everything at or before the cutoff
+# was loaded straight into the lake by the batch path and never transited the
+# bus, so the hot path has no rows there *by construction* — a cross-layer
+# comparison over 2023-2025 is not a failing check, it is a meaningless one.
+# Pinned as a constant rather than derived from the data: deriving it would make
+# the check's scope silently follow whatever happens to be loaded.
+LIVE_ERA_START = "2026-01-01"
+
+
 def _fetch(sql: str, params: tuple = ()) -> pd.DataFrame:
     """Run one query and return a frame.
 
@@ -103,6 +112,11 @@ def reconciliation() -> pd.DataFrame:
     The platform's central claim, as a query: two independent code paths over
     the same events. Only post-cutoff days are comparable — backfilled days
     never transited the bus, so the hot path never saw them.
+
+    Bounded at LIVE_ERA_START rather than left open: the inner join alone would
+    hide the intent, since it happens to exclude 2023-2025 only because the hot
+    path has no rows there. Stating the bound makes the scope a decision instead
+    of a side effect.
     """
     return _fetch(
         """
@@ -114,11 +128,14 @@ def reconciliation() -> pd.DataFrame:
             SELECT window_start::date AS d, sum(trip_count) AS hot_trips
             FROM trip_window_metrics
             WHERE zone_id IS NULL
+              AND window_start >= %s
             GROUP BY 1
         ) h ON h.d = c.metric_date
         WHERE c.zone_id IS NULL
+          AND c.metric_date >= %s
         ORDER BY c.metric_date
-        """
+        """,
+        (LIVE_ERA_START, LIVE_ERA_START),
     )
 
 

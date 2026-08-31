@@ -459,10 +459,16 @@ def scoring_feed(start, end) -> None:
         pd.to_datetime(feed["dropoff_datetime"]) - pd.to_datetime(feed["pickup_datetime"])
     ).dt.total_seconds() / 60
 
+    # Cumulative, matching how the bands read: "within 25%" is green plus amber,
+    # i.e. everything the table does not colour red. Two thresholds rather than
+    # one because a single number hides the shape — a model can be poor at 10%
+    # and perfectly usable at 25%, and for a fare quote that distinction matters.
     within_10 = float((feed["error_pct"].abs() < 10).mean() * 100)
-    left, middle, right = st.columns(3)
+    within_25 = float((feed["error_pct"].abs() < 25).mean() * 100)
+    left, second, third, right = st.columns(4)
     left.metric("Quotes shown", f"{len(feed):,}")
-    middle.metric("Within 10%", f"{within_10:.0f}%")
+    second.metric("Within 10%", f"{within_10:.0f}%")
+    third.metric("Within 25%", f"{within_25:.0f}%")
     right.metric("Median error", f"${feed['error'].abs().median():.2f}")
 
     st.altair_chart(
