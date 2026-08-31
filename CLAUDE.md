@@ -79,13 +79,20 @@ scaffold future phases early.
   schema + `year=/month=/day=` partitions. Also verified: Airflow runs both DAGs unattended,
   and hot vs cold trip counts reconcile exactly on a single replay.
 - **P5 — ML** (done): fare estimation at pickup. Trains on <=cutoff, scores post-cutoff
-  events off the bus, and an Airflow DAG records daily predicted-vs-actual error. Verified:
-  normal-day MAE $4.36-$4.94 against $3.91 in training, and a New Year's Day R2 of 0.025 the
-  evaluation caught on its own.
-- **P6 — Dashboard** (built, browser pass outstanding): Streamlit shows live hot metrics,
-  cold historical trends, a per-trip quoted-vs-charged feed, and anomaly alerts — refreshing
-  as the simulator replays. Read-only by design: it owns no tables and writes nothing, which
-  is why it filters the view and hands you the replay command rather than starting one.
+  events off the bus, and an Airflow DAG records daily predicted-vs-actual error. Now on
+  `fare-hgb-3`, retrained over all 36 pre-cutoff months: normal-day MAE $4.30-$4.85, R2
+  0.72-0.74, better than v2 on all eight evaluated days. New Year's Day R2 is still 0.047 —
+  a real limit the evaluation caught on its own.
+  **Two ordering rules, both learned the hard way:** evaluate the outgoing model *before*
+  re-scoring (the re-score upserts in place and destroys its per-trip rows), and pause
+  `ml_daily_eval` for the duration (it is on a 5-minute schedule).
+- **P6 — Dashboard** (done): Streamlit shows live hot metrics, cold historical trends, a
+  per-trip quoted-vs-charged feed, and anomaly alerts — refreshing as the simulator replays.
+  Read-only by design: it owns no tables and writes nothing, which is why it filters the view
+  and hands you the replay command rather than starting one. Verified in the browser against
+  a running replay: feed and hot panels advance on their own, error bands colour correctly.
+  Every panel honours one event-time range; the live feed can outrun its upper bound
+  ("Follow live"), because a feed needing a page reload to show live data is not live.
 
 ## How we work together
 
@@ -101,6 +108,12 @@ scaffold future phases early.
 
 ## Don't
 
+- **`curl` test payloads into the running gateway.** The topic is append-only and every
+  derived store rebuilds from it, so a throwaway test event is permanent. Test adapters
+  directly instead. See DECISIONS 2026-08-31.
+- **Assume `git pull` deployed anything.** Source is baked into images; use
+  `docker compose up -d --build`. A correct schema migration once sat unexecuted for weeks
+  because the image predated it.
 - Commit secrets or data (`.env`, `*.parquet`, raw datasets).
 - Scaffold future phases ahead of time.
 - Merge separate services into one container to save time.

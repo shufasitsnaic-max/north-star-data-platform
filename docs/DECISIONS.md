@@ -15,115 +15,83 @@ useful if it's curated, not a dump.
 
 ---
 
-## Resuming — read this first  · paused 2026-08-30 ~15:10 UTC
+## Resuming — read this first  · paused 2026-08-31
 
-> **Superseded in part on 2026-08-31.** The backfill described below is **complete** —
-> 36 continuous months, 1,100 days from 2023-01-01. Its recovery command was also
-> wrong; see *Operational findings + fixes — 2026-08-31* at the foot of this file for
-> the corrected form and what else changed.
-
-All six phases are built. P1-P5 are verified end to end; P6 renders but its newest panels
-have not had a browser pass. One long-running job was left mid-flight.
+All six phases are **built and verified**, including P6's browser pass. Nothing is
+mid-flight. The detail behind everything below lives in the two 2026-08-31 entries at the
+foot of this file.
 
 ### State when work stopped
 
 | | |
 |---|---|
-| Lake | 27 of 36 months loaded for 2023-01..2025-12, plus 2026-01..04 from replay |
-| Serving table | ~103k rows / 430 days — **stale**, the backfill's merge has not run yet |
-| Predictions | ~205k over 2026-01-01..04, model `fare-hgb-2` |
-| `cold_path_backfill` | run `manual__2026-08-30T13:14:25+00:00` **still `running`**, DAG **paused** |
-| `cold_path_incremental` | unpaused, healthy, ~121s per run on a 3-minute schedule |
-| Disk | ~6.6GB free of 32GB, shared between `/workspaces` and `/var/lib/docker` |
+| Lake | **36 continuous months**, 2023-01..2025-12, plus 2026-01-01..08 from replay |
+| Serving table | ~256k rows / **1,100 days** from 2023-01-01 — complete, no gaps |
+| Predictions | ~232k, model **`fare-hgb-3`** (v2 fully overwritten) |
+| Evaluation | v2 and v3 both recorded in `ml_daily_eval` for 2026-01-01..08 |
+| Airflow | `cold_path_incremental` unpaused; `ml_daily_eval` unpaused; `cold_path_backfill` done |
+| Disk | ~6.4GB free of 32GB, shared between `/workspaces` and `/var/lib/docker` |
 
-### First action: finish the backfill
-
-The DAG was **paused mid-run** — most likely toggled by accident in the UI while deleting a
-duplicate run. A paused DAG leaves an in-flight run untouched: it stays `running` with its
-remaining tasks stuck in `scheduled` indefinitely, which reads as a hang rather than a
-setting. Worth knowing because nothing about the symptom points at the cause.
+### Starting up
 
 ```bash
 cd /workspaces/north-star-data-platform
-docker compose up -d                     # everything; restart policies cover most of it
-docker compose exec airflow-scheduler airflow dags unpause cold_path_backfill
+docker compose up -d
 ```
 
-It resumes at map index 27 within ~30s. Nine months remain at ~215s each, 2 concurrent, so
-**~16 minutes**, then `aggregate_history` (one Spark pass over ~110M rows, 10-20 min) and the
-merge.
-
-Confirm it moved rather than assuming:
+Then a paced replay — Jan 9 onward is unreplayed, so it lands at the top of the feed:
 
 ```bash
-docker compose exec airflow-scheduler airflow tasks states-for-dag-run \
-  cold_path_backfill "manual__2026-08-30T13:14:25+00:00"
+docker compose run --rm \
+  -e START_DATETIME=2026-01-09T00:00:00 -e MAX_ROWS=12000 -e SLEEP=0.1 simulator
 ```
 
-Success count climbs to 38 (36 months + `ensure_schema` + `aggregate_history`). Then:
+`SLEEP=0.1` gives ~10 events/sec, readable on the dashboard. Omit it for ~420/sec. Port
+8501 needs adding by hand in the PORTS panel until a container rebuild picks up
+`devcontainer.json`; use the forwarded `*.app.github.dev` URL, never laptop `localhost`.
 
-```bash
-docker compose exec -T postgres psql -U northstar -d northstar -c "
-SELECT count(*) AS rows, min(metric_date), max(metric_date),
-       count(DISTINCT metric_date) AS days FROM cold_daily_zone_metrics;"
-```
+### Known cosmetic artifacts — not bugs, do not re-investigate
 
-**~300k rows across ~1,100 days from 2023-01-01** is the target. Until that lands the
-dashboard's history chart still shows three disconnected islands rather than three continuous
-years.
+- **A 1-trip `2026-03-01` row in the cold path**, regenerating every three minutes. Two test
+  `curl` payloads reached the topic; the cold path rebuilds from the whole topic every run,
+  so it cannot be deleted. It also spikes that day's `avg_fare` to ~$37.60.
+- **Jan 1 predictions are exactly 2x the lake's trips** (39,250 vs 19,625) — pre-fix `uuid4`
+  duplication, permanent, does not bias MAE.
+- **Uneven 2026 coverage**: Jan 1 ~17% of source, Jan 2 ~20%, Jan 3 ~97%, Jan 4 ~43%.
 
-If the run has been marked `failed` by a scheduler restart, do not re-trigger from scratch —
-clear the unfinished tasks instead, since the 27 loaded months need no reloading:
+All three would be cleared by a clean 2026 rebuild (recreate the topic, replay from Jan 1).
+Declined as not worth the destruction — see the retrain entry.
 
-```bash
-docker compose exec airflow-scheduler airflow tasks clear cold_path_backfill \
-  --start-date 2026-08-30 --end-date 2026-08-30 --only-failed --yes
-```
+### Traps, all previously paid for
 
-### Then, in order
-
-1. **Browser pass on the dashboard**, the only thing standing between P6 and verified. The
-   palette was validated computationally; layout was never looked at. Check label collisions,
-   column widths and overflow on the scoring feed. Port 8501 needs adding by hand in the
-   PORTS panel until the next container rebuild picks up `devcontainer.json`.
-2. **Longer 2026 replay.** Four event-time days is enough to separate the holiday from normal
-   days, not enough for a weekly or seasonal picture. The sidebar renders the command; ~420
-   events/sec.
-3. **Retrain on the full corpus.** The current model saw 14 months. After the backfill the
-   lake holds 36, and `TRAIN_SAMPLE_ROWS` stratifies across whatever is there. Remember the
-   consumer-group reset afterwards or nothing re-scores — the command is in `predictor.py`.
-
-### Known traps, all previously paid for
-
-- `docker compose run` uses the **cached image**; add `--build` after changing source, or the
-  old code runs and looks like a mystery.
-- `spark-submit --master` is **silently ignored** — set `SPARK_MASTER` in the environment.
-  `--packages` is the opposite: it *must* be on the submit line or in `spark-defaults.conf`,
-  because connectors are resolved before the JVM exists.
-- **Training a new model re-scores nothing** until the Kafka consumer group is reset.
-- **Never evaluate while the predictor is re-scoring** — the evaluation is a full recompute
-  over a table another service is rewriting, and produces rows that do not partition.
-- `devcontainer.json`'s `forwardPorts` is read **only at container creation**; add ports by
-  hand in the PORTS panel meanwhile. Codespaces never exposes ports on the laptop's
-  `localhost` — use the forwarded `*.app.github.dev` URL.
-- Watch **disk**. `/workspaces` and `/var/lib/docker` share one 32GB filesystem, and Spark's
-  worker scratch grew to 8.49GB unnoticed before cleanup was enabled.
+- **`git pull` deploys nothing.** Source is baked into images; anything expected to change
+  needs `docker compose up -d --build`. This cost a session — a correct schema migration sat
+  unexecuted in an image built before it was written.
+- **A paused DAG strands its in-flight run.** Remaining tasks park at `scheduled` forever and
+  the run never leaves `running`. Hit three times in one day. Wait on the specific *task*,
+  never the run state.
+- **`airflow tasks clear` with bare dates does nothing** — both bounds parse to midnight, so a
+  same-day range is zero-width. Use full timestamps. Run without `--yes` first to see the list.
+- **Never `curl` test payloads into the live gateway.** The topic is append-only and every
+  derived store inherits the mistake permanently.
+- **Pause `ml_daily_eval` before re-scoring** — it is on a 5-minute schedule, so "don't
+  evaluate during a re-score" cannot be honoured by intent alone.
+- **Evaluate the outgoing model before re-scoring.** The re-score upserts in place and
+  destroys the old model's per-trip rows; only `ml_daily_eval` survives.
+- **Training a new model re-scores nothing** until the predictor's consumer group is reset.
+- `spark-submit --master` is **silently ignored** — set `SPARK_MASTER`. `--packages` is the
+  opposite and must be on the submit line.
+- **Watch disk.** `/workspaces` and `/var/lib/docker` share one 32GB filesystem.
 
 ### Shutting down
 
-Stopping the codespace is enough — **do not** `docker compose down -v`, which would destroy
-the Kafka log, both databases and Airflow's history. Named volumes and everything under
-`/workspaces` (the lake, the raw files, the model artifact) survive a stop; only container
-writable layers are lost, and nothing of value lives there.
+Stopping the codespace is enough. **Do not** `docker compose down -v` — it would destroy the
+Kafka log, both databases and Airflow's history, and the lake's 2026 half is rebuilt from
+that log. Named volumes and everything under `/workspaces` survive a stop.
 
-Stop it from github.com/codespaces, or let the idle timeout do it. **Worth doing
-deliberately**: this is a 4-core machine, which burns Student Pack core-hours at twice the
-rate of the default.
-
-On restart the Docker daemon comes back and services carrying `restart: unless-stopped`
-return by themselves; `docker compose up -d` covers the rest. Expect the first Spark submit
-after a restart to re-download connector JARs, since the Ivy cache lives in the container's
-`/tmp`.
+Stop it deliberately from github.com/codespaces: this is a 4-core machine and burns Student
+Pack core-hours at twice the default rate. Expect the first Spark submit after a restart to
+re-download connector JARs, since the Ivy cache lives in the container's `/tmp`.
 
 
 ---
@@ -1949,6 +1917,163 @@ A live feed that needs a page reload to show live data is not a live feed.
   ~207k pre-fix prediction rows carry random ids and can never be overwritten, so a genuinely
   clean 2026 needs them deleted first.
 - Retrain on the full 36-month corpus (the model still reflects 14).
+
+---
+
+## Retrain on the full corpus — `fare-hgb-3`  · 2026-08-31
+
+**Status:** complete and evaluated against v2 on the same days.
+
+### What changed, and what deliberately didn't
+
+v3 is v2 **retrained**, nothing more: identical features, identical estimator, identical
+`CUTOFF`. The only difference is that the backfill had by then loaded all 36 pre-cutoff
+months, where v2 was trained when the lake held 14.
+
+Worth being precise about what that buys, because the obvious reading is wrong.
+`TRAIN_SAMPLE_ROWS` caps training at 1.5M rows regardless, sampled **stratified by month**.
+So the corpus did not grow 2.6x — the same 1.5M rows are now spread across three full years
+instead of a bit over one. The hypothesis under test is **seasonal coverage**, not volume.
+
+**MODEL_VERSION bumped to `fare-hgb-3`** even though no code changed. `ml_daily_eval` keys
+on `(eval_date, model_version)`; retraining under the old name would have overwritten the
+very baseline the retrain exists to be measured against.
+
+### Result: v3 wins every day, by a little
+
+| day | v2 MAE | v3 MAE | change | v3 R² | v3 n |
+|---|---|---|---|---|---|
+| 2026-01-01 | 13.7263 | 13.5035 | −1.6% | 0.047 | 39,250 |
+| 2026-01-02 | 4.9400 | 4.8515 | −1.8% | 0.720 | 19,561 |
+| 2026-01-03 | 4.5041 | 4.4472 | −1.3% | 0.733 | 105,737 |
+| 2026-01-04 | 4.3564 | 4.2966 | −1.4% | 0.744 | 40,396 |
+| 2026-01-05 | 6.2101 | 6.0941 | −1.9% | 0.523 | 8,960 |
+| 2026-01-06 | 5.6403 | 5.5077 | −2.4% | 0.717 | 3,297 |
+| 2026-01-07 | 5.1082 | 4.9828 | −2.5% | 0.681 | 6,726 |
+| 2026-01-08 | 4.8734 | 4.8072 | −1.4% | 0.729 | 8,746 |
+
+Each margin is small. **Eight out of eight in the same direction is not noise**, and that is
+the honest claim to make — a real but modest gain, which is what added seasonal coverage
+*should* buy when the test days are all January and the extra months are mostly not.
+
+New Year's Day remains the outlier: 13.50 MAE, **R² 0.047**, roughly double v2's documented
+0.025 but near-zero either way. The holiday is still not predictable from pickup information
+alone. Recorded as a genuine model limit, not a defect — the daily evaluation surfacing it
+unprompted is the pipeline doing its job.
+
+### v2 is now unreproducible — stated plainly
+
+The re-score upserts on `event_id` and sets `model_version = EXCLUDED.model_version`, so it
+**overwrote every v2 prediction in place**. v2's per-trip rows no longer exist, and v2 cannot
+be retrained: `TRAIN_SAMPLE_ROWS` stratifies across whatever the lake holds, which is now 36
+months rather than the 14 v2 saw. The comparison above survives only because `ml_daily_eval`
+is a separate table keyed by `model_version` and was run *before* the re-score.
+
+**The ordering rule that follows:** evaluate the outgoing model **before** re-scoring, never
+after. A re-score is destructive to the baseline even though nothing is deleted.
+
+**And the trap under that rule:** `ml_daily_eval` runs on `*/5 * * * *`. "Do not evaluate
+during a re-score" is useless advice if a timer is doing it for you — the DAG must be
+explicitly **paused** for the duration and unpaused afterwards. Nearly missed this: the DAG
+had just been unpaused to capture the baseline.
+
+### The duplication the fix came too late for
+
+Jan 1 shows **n = 39,250** against exactly **19,625** trips in the lake — precisely 2x. That is
+the `uuid4` duplication (see the gateway fix earlier today) made visible: Jan 1 was replayed
+twice before the fix, so each trip sits in the topic twice under different random ids, and
+re-scoring faithfully produced two rows per trip. Jan 2-4 match the lake exactly, so it is
+Jan 1 alone.
+
+It does **not** bias MAE — duplicating every row leaves the mean unchanged — but the
+`predictions` count for that day is inflated, and it is **permanent**: those ids are baked
+into messages already on the topic. Replays produced after the fix dedupe correctly.
+
+### Deployment drift: a migration that was right and never ran
+
+Separate defect, found when the rebuilt dashboard crashed on
+`column "dropoff_datetime" does not exist`.
+
+`ml/sql/schema.sql` already carried the correct migration — an explicit
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, with a comment stating exactly why it could not
+be left to `CREATE TABLE IF NOT EXISTS`. It had simply never executed. `ml/predictor.py`
+applies that file **at startup**, and the running predictor was from an image built before
+the migration was written, so its baked copy of the file did not contain it. The predictor's
+`INSERT` omitted the column too, which is why predictions kept flowing with no error and the
+gap stayed invisible until a newer query touched it.
+
+**The general lesson, which outlives this column:** a `.sql` file baked into an image is only
+as current as the last rebuild of that image. `git pull` changes nothing in this stack.
+Anything whose behaviour is expected to change needs `--build`, and a schema migration is
+"deployed" only when the component that applies it has been rebuilt.
+
+### Test events sent to a live topic are permanent
+
+Two `curl` payloads were sent through the gateway to verify the derived `event_id`, dated
+`2026-03-01` — a date far outside any replayed range. The verification was redundant (the
+derivation had already been checked locally) and the cost was disproportionate:
+
+- The **hot path** keys its whole panel off `max(window_start)`. The March window became the
+  newest, so the "latest window" metric and the zone bar chart both rendered two synthetic
+  trips. Worse, it was **undeletable**: the window is the newest event time, so the watermark
+  never passes it, it never finalizes, its offsets are never committed, and it is re-flushed
+  from memory on every liveness flush. Restarting made it worse — the consumer resumed from
+  a committed offset *before* those events and rebuilt the window. Only a consumer-group
+  offset reset to `latest` cleared it.
+- The **cold path** re-reads the entire topic every three minutes with no upper bound, so the
+  March lake partition and its serving row regenerate indefinitely. A single trip at $37.60
+  also spikes that day's `avg_fare` against a normal ~$20. **Not fixed** — removing it would
+  mean removing the records from the topic, which is not feasible without destroying the
+  2026 data rebuilt from it.
+- `ml_daily_eval` gained a one-row March day (MAE 51.20, no R²). This one *was* permanently
+  deletable, the predictor's offsets having moved past it.
+
+**Fixed structurally rather than by cleanup:** `hot_windows` and `hot_top_zones` now take the
+dashboard's event-time range, with the bound carried into the `max(window_start)` subquery.
+An unbounded "latest" is only ever as sane as the newest row in the table; a bound makes this
+class of hijack impossible instead of unlikely.
+
+**Rule:** never send test payloads through the gateway into the live topic. A topic is
+append-only, and derived state rebuilt from it inherits the mistake forever. Test adapters in
+isolation.
+
+### Dashboard, this session
+
+- Scoring feed **moved above the hot path** and made genuinely live: its upper bound came
+  from `prediction_range()` at page load, so trips scored afterwards fell outside the window
+  and the panel re-queried every 10s against a range nothing new could enter. A **"Follow
+  live"** toggle (default on) drops the bound. A live feed that needs a page reload to show
+  live data is not a live feed.
+- **Live/idle badge** on the feed. An auto-refreshing fragment redrawing identical rows reads
+  as broken; the fix is not to redraw less but to say which of the two is happening.
+- **Within-25% metric** alongside within-10%. A single threshold hides the shape of the
+  error — a fare model can look poor at 10% and be perfectly usable at 25%.
+- **Cross-layer reconciliation pinned to `LIVE_ERA_START = 2026-01-01`.** Simulation only ever
+  replays post-cutoff months; 2023-2025 went straight to the lake and never transited the
+  bus. The inner join already excluded them, but as a side effect rather than a decision.
+
+### Rejected this session
+
+- **Zone-id → place-name lookup.** Proposed as a `zones` dimension seeded from TLC's
+  `taxi_zone_lookup.csv` and joined in the dashboard. Dropped as unnecessary; ids are
+  sufficient for the demo. Recorded because the reasoning is reusable if it comes back: the
+  canonical contract keeps `zone_id`, names are data in a generically-named dimension, and a
+  source swap means reseeding rather than rewriting.
+- **Clean 2026 rebuild** — recreate the topic and replay Jan onward, which would have fixed
+  the March artifact, the uneven Jan 1-4 coverage, and the Jan 1 duplication in one move.
+  Declined as not worth the destruction; all three are cosmetic or bounded.
+
+### Still open
+
+- **Airflow pool** so `aggregate_history` and `stream_to_lake` cannot race (see the earlier
+  entry today).
+- **The March 1 cold-path row**, which regenerates every three minutes by design.
+- **Uneven 2026 coverage** — Jan 1 and 2 sit at ~17-20% of source, Jan 3 at 97%.
+- **Test coverage.** Only `batch_jobs/tests/test_adapter_conformance.py` exists. The gateway's
+  `derive_event_id()` in particular was verified interactively rather than by a committed
+  test, and it is exactly the kind of pure function a test suits.
+- **`docs/capstone_blueprint.pdf` is absent** from the repo, though CLAUDE.md names it as the
+  master spec and it is not gitignored.
 
 ---
 

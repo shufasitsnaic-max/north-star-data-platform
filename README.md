@@ -141,10 +141,13 @@ cd gateway && uv sync && uv run uvicorn main:app
 > **Picking this up again?** `docs/DECISIONS.md` opens with a **Resuming** section:
 > current state, the one job left mid-flight, and the traps already paid for.
 
-**All six phases built.** Validation gateway, Kafka + producer + replay simulator, hot
-path -> PostgreSQL, the full cold path, the ML layer, and a Streamlit dashboard over
-all of it. Phases 1–5 are verified end-to-end; the dashboard renders against live data
-with a browser pass on its newest panels outstanding.
+**All six phases built and verified.** Validation gateway, Kafka + producer + replay
+simulator, hot path -> PostgreSQL, the full cold path, the ML layer, and a Streamlit
+dashboard over all of it — each against its own verification routine, the dashboard
+included.
+
+The cold store holds **1,100 continuous days** from 2023-01-01: 36 pre-cutoff months
+loaded by Spark from the raw files, plus the 2026 days replayed through the bus.
 
 The dashboard is **read-only** — it owns no tables and writes nothing, reading three
 tables written by three components that do not know it exists. It filters the view and
@@ -153,10 +156,19 @@ property intact.
 
 **Phase 5 (ML) estimates what a ride will cost, before it starts** — the upfront-pricing
 question a rider actually asks. It uses only what is known at pickup: the two zones and
-the clock, never the distance driven or the meter reading. On normal days it lands
-within **$4.36-$4.94** of the real price against **$3.91** in training. On New Year's Day
-its R2 collapses to **0.025** — the daily evaluation caught a real model weakness, with a
-nameable fix, on its first run.
+the clock, never the distance driven or the meter reading. The current model,
+`fare-hgb-3`, lands within **$4.30-$4.85** of the real price on normal days, with an R2
+of **0.72-0.74**.
+
+It is the second model the platform has measured. `fare-hgb-3` is `fare-hgb-2` retrained
+once the lake held all 36 pre-cutoff months rather than 14 — same features, same
+estimator, same row budget, so what changed is three full years of seasonal coverage
+instead of one. It improved **every one of the eight evaluated days**, by 1.3-2.5%: small
+margins, but eight for eight in the same direction.
+
+On New Year's Day its R2 collapses to **0.047** (from v2's 0.025). The holiday is not
+predictable from pickup information alone, and the daily evaluation surfaced that
+unprompted — which is the point of running it.
 
 **Phase 4 (cold path) is done.** Airflow runs both DAGs unattended — a one-shot backfill
 that mapped 12 months of history into the lake, and a recurring pipeline that recomputes
