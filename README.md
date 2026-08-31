@@ -96,7 +96,10 @@ Re-running skips months already downloaded, so an interrupted fetch resumes safe
 The project scope is 2023-01 .. 2026-05 with the train/replay cutoff at 2025-12-31 —
 see `docs/DECISIONS.md` for why 2020–2022 is deliberately excluded.
 
-### 2. Start the stack
+### 2. Start the ingest and hot path
+
+Steps 2-5 stand up the real-time half. The cold path, ML layer and dashboard follow in
+steps 6-9; each is additive, so you can stop after any of them and have a working system.
 
 ```bash
 docker compose up -d kafka gateway postgres hot_path
@@ -125,9 +128,130 @@ Rolling window metrics should appear — and keep updating — as the replay pro
 
 ```bash
 docker compose exec postgres psql -U northstar -d northstar -c \
-  "SELECT window_start, trip_count, avg_fare, is_final FROM window_metrics
+  "SELECT window_start, trip_count, avg_fare, is_final FROM trip_window_metrics
    WHERE zone_id IS NULL ORDER BY window_start DESC LIMIT 5;"
 ```
+
+### 6. Start the cold path (Airflow + Spark)
+
+The batch layer reprocesses the same events completely rather than quickly, and Airflow
+drives it. Bring up Spark and Airflow, then unpause the recurring DAG:
+
+```bash
+docker compose up -d spark-master spark-worker airflow-scheduler airflow-webserver
+docker compose exec airflow-scheduler airflow dags unpause cold_path_incremental
+```
+
+The UI is at **http://localhost:8080** (`admin` / `admin`, development only). In a
+Codespace, open the forwarded `*.app.github.dev` URL instead — ports are never on the
+laptop's `localhost`.
+
+`cold_path_incremental` runs every three minutes: bus -> lake -> daily rollups -> serving
+store. Confirm Parquet is landing, partitioned by date:
+
+```bash
+find data/lake/trips -name '*.parquet' | head -3
+```
+
+To load history that never transited the bus — the ML training corpus and the dashboard's
+long-run trends — run the one-shot backfill. It is manual by design, and **it must not run
+while `cold_path_incremental` is unpaused**: both write the same lake and will race, which
+fails the full-lake aggregation with a `SparkFileNotFoundException`.
+
+```bash
+docker compose exec airflow-scheduler airflow dags pause cold_path_incremental
+docker compose exec airflow-scheduler airflow dags trigger cold_path_backfill
+# ...when it finishes:
+docker compose exec airflow-scheduler airflow dags unpause cold_path_incremental
+```
+
+Budget roughly 3.5 minutes per month plus a full-lake aggregation at the end. Verify:
+
+```bash
+docker compose exec postgres psql -U northstar -d northstar -c \
+  "SELECT count(DISTINCT metric_date) AS days, min(metric_date), max(metric_date)
+   FROM cold_daily_zone_metrics;"
+```
+
+### 7. Train the fare model and score live
+
+Both ML services sit behind the `train` profile, so a bare `up` never triggers training.
+Train first — it reads the lake read-only and writes an artifact to `data/models/`:
+
+```bash
+docker compose run --rm ml_train
+```
+
+Then start the predictor, which scores post-cutoff events off the bus as they arrive:
+
+```bash
+docker compose up -d ml_predictor
+```
+
+```bash
+docker compose exec postgres psql -U northstar -d northstar -c \
+  "SELECT model_version, count(*) FROM fare_predictions GROUP BY 1;"
+```
+
+**Training a new model re-scores nothing by itself.** The predictor has already read past
+the events in the topic, so a new version only applies to new arrivals. To re-score history
+under a new model, stop it, rewind its consumer group, and start it again:
+
+```bash
+docker compose stop ml_predictor
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group ml-predictor \
+  --topic tlc-raw-events --reset-offsets --to-earliest --execute
+docker compose start ml_predictor
+```
+
+Two ordering rules, both learned the hard way. Run the daily evaluation for the **outgoing**
+model *before* re-scoring — the re-score upserts in place and destroys its per-trip rows,
+leaving `ml_daily_eval` as the only surviving record. And **pause `ml_daily_eval` while a
+re-score is running**: it is on a five-minute schedule, so intending not to evaluate mid-flight
+is not enough.
+
+### 8. Record daily predicted-vs-actual error
+
+```bash
+docker compose exec airflow-scheduler airflow dags unpause ml_daily_eval
+```
+
+Runs every five minutes, comparing quotes against what each trip actually cost, bucketed by
+the day the trip *happened*:
+
+```bash
+docker compose exec postgres psql -U northstar -d northstar -c \
+  "SELECT eval_date, model_version, mae, r2, predictions
+   FROM ml_daily_eval ORDER BY eval_date DESC LIMIT 5;"
+```
+
+### 9. Open the dashboard
+
+```bash
+docker compose up -d dashboard
+```
+
+**http://localhost:8501** — or the forwarded `*.app.github.dev` URL in a Codespace, where
+port 8501 may need adding by hand in the PORTS panel (`devcontainer.json`'s `forwardPorts`
+is read only at container creation).
+
+Start a replay alongside it to watch the live panels move. `SLEEP` throttles the default
+~420 events/sec into something readable:
+
+```bash
+docker compose run --rm \
+  -e START_DATETIME=2026-01-09T00:00:00 -e MAX_ROWS=12000 -e SLEEP=0.1 simulator
+```
+
+The quote feed's badge turns green while trips are being scored and says so when idle — an
+auto-refreshing panel that redraws unchanged rows is idle, not broken.
+
+> **Rebuilding after a code change:** source is baked into images, so `git pull` on its own
+> deploys nothing. Anything whose behaviour should change needs
+> `docker compose up -d --build <service>`. This applies to `.sql` files too — a schema
+> migration is deployed only once the component that applies it has been rebuilt.
+
 
 The gateway alone can still be run standalone (Phase 1 style), though it now needs a
 reachable broker:
