@@ -64,7 +64,15 @@ logger = logging.getLogger("ml.train")
 # every prediction row so the daily evaluation can tell one model's errors from
 # another's — without it, swapping models silently mixes two error series into
 # one meaningless average.
-MODEL_VERSION = "fare-hgb-2"
+#
+# v3 changes neither features nor estimator: it is v2 retrained once the backfill
+# had loaded all 36 pre-cutoff months, where v2 saw 14. TRAIN_SAMPLE_ROWS caps the
+# row count either way, so the corpus did not grow — it got three full years of
+# seasonality instead of just over one, which is the hypothesis v3 tests. Bumped
+# anyway, because the same estimator on a different corpus is a different model,
+# and ml_daily_eval keys on (eval_date, model_version): reusing "fare-hgb-2" would
+# overwrite the baseline this retrain exists to be compared against.
+MODEL_VERSION = "fare-hgb-3"
 
 _COLUMNS = [
     "pickup_datetime",
