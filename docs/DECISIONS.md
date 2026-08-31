@@ -17,6 +17,11 @@ useful if it's curated, not a dump.
 
 ## Resuming — read this first  · paused 2026-08-30 ~15:10 UTC
 
+> **Superseded in part on 2026-08-31.** The backfill described below is **complete** —
+> 36 continuous months, 1,100 days from 2023-01-01. Its recovery command was also
+> wrong; see *Operational findings + fixes — 2026-08-31* at the foot of this file for
+> the corrected form and what else changed.
+
 All six phases are built. P1-P5 are verified end to end; P6 renders but its newest panels
 have not had a browser pass. One long-running job was left mid-flight.
 
@@ -1783,6 +1788,167 @@ returns the next time the backfill grows.
 - **Future source swap** (TLC -> another taxi/weather source) = new adapter + schema
   adjustment only; nothing downstream of the adapter should change. This is the whole
   point of the canonical contract, and it survives the streamlining unchanged.
+
+---
+
+## Operational findings + fixes — 2026-08-31
+
+The backfill finished. Three things went wrong on the way, and two of them were the
+platform telling the truth about a real defect rather than misbehaving.
+
+### The backfill's last two tasks: a DAG race, not a hang
+
+All 36 `bulk_load` months succeeded, then `aggregate_history` **failed after 94 seconds**
+against an expected 10-20 minutes — the giveaway that it died on startup rather than
+part-way:
+
+```
+SparkFileNotFoundException: File file:/data/lake/trips/year=2026/month=1/day=3/
+part-00001-....snappy.parquet does not exist
+```
+
+**Cause:** `cold_path_incremental` was unpaused and firing every three minutes.
+`stream_to_lake` reads the topic `earliest` -> `latest` on *every* run and rewrites all
+post-cutoff partitions with dynamic overwrite — new events or not. `aggregate_history`
+needs an uninterrupted multi-minute scan of the whole lake, including those same 2026
+partitions. It cannot win that race; the rewrite deleted a file mid-scan.
+
+Not a fluke — **near-100% reproducible**. The backfill is designed as a one-shot to run
+*before* the recurring DAG is live, and nothing enforces that.
+
+**Fix applied:** pause `cold_path_incremental`, wait for `stream_to_lake` to finish, clear
+the two dead tasks, let them rerun, unpause. Worked first time: `aggregate_history` took
+2m34s.
+
+**Deferred, not done:** an Airflow pool with one slot shared by both DAGs' Spark tasks, so
+they serialize instead of racing. Rejected doing it inline because the backfill was the
+priority and a pool changes scheduling behaviour for every future run — it deserves its own
+change. The tradeoff to weigh then: a long backfill would *block* incremental runs rather
+than corrupt them, which is the right failure but a visible one.
+
+### Pausing a DAG strands its in-flight run — twice in one session
+
+Already recorded on 2026-08-30 for `cold_path_backfill`; hit again immediately for
+`cold_path_incremental` while applying the fix above. A paused DAG keeps its
+currently-running task but parks every remaining task at `scheduled` indefinitely, so the
+run never leaves `running`.
+
+**Consequence for any "wait for it to finish" check:** waiting on the *run* state hangs
+forever. Wait on the specific **task** instead — here only `stream_to_lake` writes the lake,
+so that task reaching `success` is the real safety condition, whatever the run says.
+
+### The documented `tasks clear` command was wrong
+
+The resume checklist's recovery command silently did nothing, reporting `Nothing to clear`:
+
+```bash
+airflow tasks clear cold_path_backfill --start-date 2026-08-30 --end-date 2026-08-30
+```
+
+Both dates parse to **midnight**, making a zero-width window that excludes a run whose
+execution date is `13:14:25`. Corrected form — exact timestamps, or a bracketing range:
+
+```bash
+airflow tasks clear cold_path_backfill -t "aggregate_history|merge_into_serving" \
+  --start-date "2026-08-30T13:14:25+00:00" --end-date "2026-08-30T13:14:25+00:00"
+```
+
+Run it **without** `--yes` first: the confirmation prompt lists what it will clear, which is
+the only cheap guard against a regex that matches more than intended.
+
+### The "corrupted zone" that wasn't — and an ad-hoc query that was
+
+A day appearing ~5x its neighbours in `cold_daily_zone_metrics` looked like double-counting.
+It was not. Two separate things were confusing the picture:
+
+1. **A bad diagnostic query.** `SELECT sum(trip_count) ... GROUP BY metric_date` counts the
+   `zone_id IS NULL` **citywide rollup row on top of the per-zone rows it summarises** —
+   every figure doubled. Confirmed exactly: a day showing 4,810 had precisely 2,405 scored
+   trips. Any ad-hoc query over this table must filter `zone_id IS NOT NULL` or read the
+   rollup alone; the two must never be summed together.
+2. **Uneven replay coverage, which is real but harmless.** Against source counts:
+
+   | date | in source | in lake | coverage |
+   |---|---|---|---|
+   | 2026-01-01 | 114,466 | 19,625 | 17% |
+   | 2026-01-02 | 100,054 | 19,561 | 20% |
+   | 2026-01-03 | 108,632 | 105,737 | 97% |
+   | 2026-01-04 | 93,622 | 40,396 | 43% |
+
+   Every day sits at or *below* source, so nothing multiplied — earlier sessions simply
+   replayed different spans. Jan 3 is the only near-complete day.
+
+**The check that settles duplication-vs-coverage:** compare against source, and verify
+`sum(trip_count) FILTER (WHERE zone_id IS NOT NULL)` equals the citywide row per day. It did,
+on every day — the aggregation is internally consistent.
+
+### Gateway: `event_id` is now derived, not random
+
+**The real defect, found while investigating the above.** `ml/sql/schema.sql` documents
+`fare_predictions.event_id` as *"the canonical event id, which the batch adapter derives from
+the natural key. Primary key, so re-consuming an event rewrites its quote rather than
+recording a second one."* The batch adapter does exactly that. **The gateway did not** — it
+minted a `uuid4()` per request, reasoning it "sees each record once."
+
+That premise is false in a replay-driven system: the simulator replays the same historical
+trips on every run, so the same trip arrived with a different id each time and the primary
+key stopped deduplicating anything. Error metrics were silently weighted by how often a trip
+happened to be replayed.
+
+**Fix:** `derive_event_id()` in `gateway/adapters/tlc_adapter.py` — SHA-256 over the same
+six-field natural key the cold path dedupes on, UUID-shaped. It lives in the adapter because
+it reads TLC field names; putting it in `main.py` or the canonical schema would breach the
+source-independence rule. `adapt_tlc()`'s signature is unchanged, so it stays pure and
+nothing downstream moved.
+
+- **Rejected: migrating `fare_predictions` to a natural-key primary key.** The schema's
+  guarantee was already correct; only the gateway was violating it. A migration would have
+  changed the table to accommodate a bug rather than fixing the bug.
+- **Rejected: byte-identical ids with the batch adapter.** Spark renders numbers by its own
+  rules (`132` vs `132.0`, and float formatting differs from Python's), so matching two
+  runtimes is fragile and buys nothing — batch owns 2023-2025, the gateway owns 2026, the
+  ranges never overlap, and nothing joins on `event_id` across them. Determinism *within*
+  the gateway path is the whole requirement.
+- **Cost accepted:** two genuinely distinct trips sharing all six fields collapse into one
+  prediction. Identical to the tradeoff `_deduplicate` already documents in the cold path,
+  and far cheaper than double-counting whole replays.
+
+**Important limit:** `event_id` is stamped into the Kafka payload at produce time, so the
+~207k messages already in the topic keep their random ids permanently. The fix applies only
+to newly produced messages — **do not reset the predictor's consumer group** expecting a
+re-score to rebuild them with derived ids. It won't.
+
+### Dashboard: the scoring feed was filtered out of its own live data
+
+The hot-path panels visibly refreshed while the per-trip quote feed sat still. Not a fragment
+problem — both are `@st.fragment(run_every="10s")`. The hot panels have **no date filter**;
+the feed is bounded by the sidebar range, whose maximum comes from `prediction_range()` **at
+page load**. Trips scored after that fall outside the window, so the feed re-queried every ten
+seconds against a range nothing new could enter, and looked frozen while working perfectly.
+
+A live feed that needs a page reload to show live data is not a live feed.
+
+- `live_predictions` / `prediction_windows` accept `end=None` for an open upper bound.
+- Sidebar **"Follow live"** checkbox, **on by default**, drops the feed's upper bound. The
+  history panels still respect the range.
+- The caption states which mode it is in — "as they are scored" vs "in the selected range".
+  Rejected leaving the wording static: it would actively mislead exactly when a reader is
+  trying to work out why the table is or isn't moving.
+- **Feed moved above the hot path**, directly under the alerts — it is the panel most worth
+  watching during a replay, so it gets the position that needs no scrolling. Rendered into a
+  `st.container()` reserved at the top, because the fragment is defined further down the file:
+  Python needs the `def` before the call, the reader wants the panel before the charts.
+
+### Still open
+
+- Browser pass on the reordered dashboard. Specifically unverified: whether a self-refreshing
+  fragment rendered into an earlier-declared container keeps auto-updating. If it doesn't, move
+  the whole `scoring_feed` definition above `hot_panel()` and drop the container.
+- The Airflow pool described above.
+- Evening out 2026 coverage. Now safe to re-replay any range, since ids are derived — but the
+  ~207k pre-fix prediction rows carry random ids and can never be overwritten, so a genuinely
+  clean 2026 needs them deleted first.
+- Retrain on the full 36-month corpus (the model still reflects 14).
 
 ---
 
