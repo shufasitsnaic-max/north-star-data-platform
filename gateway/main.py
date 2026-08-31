@@ -13,13 +13,12 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 
 import producer
-from adapters.tlc_adapter import adapt_tlc
+from adapters.tlc_adapter import adapt_tlc, derive_event_id
 from schemas.tlc import TLCTripInput
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -51,7 +50,14 @@ def ingest_trip(trip: TLCTripInput) -> dict[str, str]:
     # pickup), which only surfaces once adapt_tlc builds the canonical TripEvent
     # and its validators run.
     try:
-        event = adapt_tlc(trip, event_id=uuid4(), ingested_at=datetime.now(timezone.utc))
+        # Derived, not random: the simulator replays the same historical trips on
+        # every run, and a fresh id per delivery would make each replay a new set
+        # of trips downstream. See derive_event_id().
+        event = adapt_tlc(
+            trip,
+            event_id=derive_event_id(trip),
+            ingested_at=datetime.now(timezone.utc),
+        )
     except ValidationError as exc:
         logger.exception("rejected trip record during adaptation")
         # include_*=False: the default error dicts embed the attempted TripEvent
