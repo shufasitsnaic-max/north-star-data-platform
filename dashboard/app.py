@@ -74,6 +74,13 @@ st.caption(
 
 alert_slot = st.container()
 
+# The scoring feed renders here, above the hot path: it is the panel most worth
+# watching during a replay, so it gets the position that needs no scrolling.
+# Reserved as a container because the fragment that fills it is defined below —
+# Python needs the def before the call, the reader wants the panel before the
+# charts, and a container is what reconciles the two.
+feed_slot = st.container()
+
 # ---------------------------------------------------------------------------
 # Controls. The dashboard stays strictly read-only: it filters the *view* and
 # hands you the command to drive the simulation, rather than launching
@@ -103,6 +110,18 @@ with st.sidebar:
         range_end = picked[1] if isinstance(picked, tuple) and len(picked) > 1 else range_start
     else:
         range_start = range_end = date.today()
+
+    # The range widget's maximum is whatever had been scored when the page
+    # loaded. During a replay that goes stale within seconds, so a feed bounded
+    # by it silently stops showing new trips — the panel looks frozen while the
+    # pipeline is working. On by default because a live feed that needs a page
+    # reload to show live data is not a live feed.
+    follow_live = st.checkbox(
+        "Follow live",
+        value=True,
+        help="Pin the quote feed to the newest trips as they are scored, "
+        "ignoring the end date above. The history panels still respect it.",
+    )
 
     st.divider()
     st.header("Replay")
@@ -384,8 +403,12 @@ def _band(error_pct: float) -> str:
 @st.fragment(run_every="10s")
 def scoring_feed(start, end) -> None:
     st.subheader("Live — fare quotes as they are scored")
+    # Say which mode the panel is in. "Selected range" would be a lie while
+    # following, and the difference is exactly what a reader needs to know when
+    # the table is or isn't moving.
+    scope = "as they are scored" if end is None else "in the selected range"
     st.caption(
-        "Every trip the model has priced in the selected range, newest first. Quoted "
+        f"Every trip the model has priced {scope}, newest first. Quoted "
         "and charged sit side by side because they arrive together: a replayed event "
         "describes a finished trip, so it carries its own fare. The model never sees "
         "that fare, the distance, or the dropoff time."
@@ -394,8 +417,9 @@ def scoring_feed(start, end) -> None:
     feed = queries.live_predictions(start, end)
     if feed.empty:
         st.info(
-            "No quotes in this range. Predictions cover 2026 onward — pick a later "
-            "range, or start a replay with the command in the sidebar."
+            "No quotes yet. Predictions cover 2026 onward — widen the range, or "
+            "start a replay with the command in the sidebar. The feed only moves "
+            "while a replay is running."
         )
         return
 
@@ -489,10 +513,12 @@ def scoring_feed(start, end) -> None:
     )
 
 
-scoring_feed(
-    datetime.combine(range_start, time.min),
-    datetime.combine(range_end, time.max),
-)
+with feed_slot:
+    scoring_feed(
+        datetime.combine(range_start, time.min),
+        None if follow_live else datetime.combine(range_end, time.max),
+    )
+    st.divider()
 
 # ---------------------------------------------------------------------------
 # Alerts — rendered into the slot reserved at the top

@@ -147,9 +147,17 @@ def live_predictions(start, end, limit: int = 300) -> pd.DataFrame:
     replayed event describes a finished trip, so it carries the fare with it.
     The error is computed in SQL rather than in pandas so the same definition
     serves the table and any future aggregate over it.
+
+    `end=None` means no upper bound. That is what makes the feed *live*: the
+    range widget's maximum is fixed when the page loads, so a bounded query can
+    never show a day that started replaying since — the feed would re-run every
+    ten seconds against a window nothing new can enter, and look frozen while
+    working perfectly.
     """
+    upper = "AND pickup_datetime < %s" if end is not None else ""
+    params = (start, end, limit) if end is not None else (start, limit)
     return _fetch(
-        """
+        f"""
         SELECT pickup_datetime,
                dropoff_datetime,
                pickup_zone_id,
@@ -161,11 +169,12 @@ def live_predictions(start, end, limit: int = 300) -> pd.DataFrame:
                     THEN 100 * (predicted_amount - actual_amount) / abs(actual_amount)
                END AS error_pct
         FROM fare_predictions
-        WHERE pickup_datetime >= %s AND pickup_datetime < %s
+        WHERE pickup_datetime >= %s
+          {upper}
         ORDER BY pickup_datetime DESC
         LIMIT %s
         """,
-        (start, end, limit),
+        params,
     )
 
 
@@ -176,9 +185,13 @@ def prediction_windows(start, end) -> pd.DataFrame:
     The same grain the hot path uses, so the two live panels are directly
     comparable. This is the chart that *grows* as a replay advances: each new
     window appends a point rather than redrawing history.
+
+    `end=None` is open-ended, for the same reason as live_predictions().
     """
+    upper = "AND pickup_datetime < %s" if end is not None else ""
+    params = (start, end) if end is not None else (start,)
     return _fetch(
-        """
+        f"""
         SELECT date_trunc('hour', pickup_datetime)
                  + (floor(date_part('minute', pickup_datetime) / 5) * interval '5 minutes')
                  AS window_start,
@@ -186,11 +199,12 @@ def prediction_windows(start, end) -> pd.DataFrame:
                avg(predicted_amount) AS predicted,
                avg(actual_amount)    AS actual
         FROM fare_predictions
-        WHERE pickup_datetime >= %s AND pickup_datetime < %s
+        WHERE pickup_datetime >= %s
+          {upper}
         GROUP BY 1
         ORDER BY 1
         """,
-        (start, end),
+        params,
     )
 
 
