@@ -220,7 +220,10 @@ def prediction_range() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=30)
+# Matched to the scoring feed's refresh interval: this drives the live/idle
+# badge, so a 30s cache would report "idle" for twenty seconds after a replay
+# started — the one moment the badge most needs to be right.
+@st.cache_data(ttl=10)
 def prediction_freshness() -> pd.DataFrame:
     """When the predictor last wrote anything. Drives the 'scoring idle' alert."""
     return _fetch(

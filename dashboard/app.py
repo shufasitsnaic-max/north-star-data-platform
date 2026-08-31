@@ -400,6 +400,15 @@ def _band(error_pct: float) -> str:
     return "critical"
 
 
+def _ago(seconds: float) -> str:
+    """Humanised age. Seconds while it matters, then coarser — nobody reads 4,812s."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
 @st.fragment(run_every="10s")
 def scoring_feed(start, end) -> None:
     st.subheader("Live — fare quotes as they are scored")
@@ -413,6 +422,27 @@ def scoring_feed(start, end) -> None:
         "describes a finished trip, so it carries its own fare. The model never sees "
         "that fare, the distance, or the dropoff time."
     )
+
+    # Whether anything is actually arriving. A panel that redraws identical rows
+    # every ten seconds reads as broken rather than idle, and the honest fix is
+    # not to redraw less often — it is to say which of the two is happening.
+    fresh = queries.prediction_freshness()
+    last_written = fresh.iloc[0]["last_written"] if not fresh.empty else None
+    if pd.notna(last_written):
+        written = pd.Timestamp(last_written)
+        written = written.tz_localize("UTC") if written.tzinfo is None else written.tz_convert("UTC")
+        age = (pd.Timestamp.now(tz="UTC") - written).total_seconds()
+        if age < 30:
+            st.success(
+                f"Scoring now — newest quote {_ago(age)} old, refreshing every 10s.",
+                icon="🟢",
+            )
+        else:
+            st.info(
+                f"Idle — newest quote is {_ago(age)} old. The panel still refreshes every "
+                "10s, but nothing new appears until a replay is running.",
+                icon="⏸️",
+            )
 
     feed = queries.live_predictions(start, end)
     if feed.empty:
